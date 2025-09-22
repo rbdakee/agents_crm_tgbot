@@ -1,7 +1,7 @@
 import csv
-import requests
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+import httpx
 from config import N8N_WEBHOOK_URL, AGENTS_FILE
 from cache import cache_manager
 
@@ -9,7 +9,16 @@ logger = logging.getLogger(__name__)
 
 class CRMData:
     def __init__(self):
-        self.agents = self.load_agents()
+        self.agents: Dict[str, str] = self.load_agents()  # phone -> name
+        # Обратная мапа для быстрого поиска телефона по имени
+        self.agent_name_to_phone: Dict[str, str] = {name: phone for phone, name in self.agents.items() if name}
+        self._client: Optional[httpx.AsyncClient] = None
+        self._request_timeout_seconds: float = 15.0
+    
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._request_timeout_seconds)
+        return self._client
     
     def load_agents(self) -> Dict[str, str]:
         """Загружает список агентов из CSV файла"""
@@ -30,21 +39,25 @@ class CRMData:
     def get_agent_by_phone(self, phone: str) -> Optional[str]:
         """Возвращает имя агента по номеру телефона"""
         return self.agents.get(phone)
+
+    def get_phone_by_agent(self, agent_name: str) -> Optional[str]:
+        """Возвращает номер телефона по имени агента"""
+        return self.agent_name_to_phone.get(agent_name)
     
-    def get_all_contracts(self) -> List[Dict]:
-        """Получает все контракты из n8n"""
+    async def get_all_contracts(self) -> List[Dict]:
+        """Получает все контракты из n8n (async)"""
         try:
-            response = requests.get(N8N_WEBHOOK_URL)
+            client = await self._get_client()
+            response = await client.get(N8N_WEBHOOK_URL)
             if response.status_code == 200:
                 return response.json()
-            else:
-                logger.error(f"Ошибка получения контрактов: {response.status_code}")
-                return []
+            logger.error(f"Ошибка получения контрактов: {response.status_code}")
+            return []
         except Exception as e:
             logger.error(f"Ошибка при запросе к n8n: {e}")
             return []
     
-    def get_contracts_by_agent(self, agent_name: str) -> List[Dict]:
+    async def get_contracts_by_agent(self, agent_name: str) -> List[Dict]:
         """Получает контракты конкретного агента"""
         # Нормализуем имя агента (убираем лишние пробелы)
         normalized_agent_name = ' '.join(agent_name.strip().split())
@@ -55,7 +68,7 @@ class CRMData:
             return cached_contracts
         
         # Если кеша нет, загружаем из API
-        all_contracts = self.get_all_contracts()
+        all_contracts = await self.get_all_contracts()
         agent_contracts = []
         
         for contract in all_contracts:
@@ -74,7 +87,7 @@ class CRMData:
         
         return agent_contracts
     
-    def search_contract_by_crm_id(self, crm_id: str, agent_name: str) -> Optional[Dict]:
+    async def search_contract_by_crm_id(self, crm_id: str, agent_name: str) -> Optional[Dict]:
         """Поиск контракта по CRM ID (только для агента)"""
         # Нормализуем имя агента
         normalized_agent_name = ' '.join(agent_name.strip().split())
@@ -85,7 +98,7 @@ class CRMData:
             return cached_contract
         
         # Если в кеше нет, ищем в загруженных контрактах агента
-        agent_contracts = self.get_contracts_by_agent(agent_name)
+        agent_contracts = await self.get_contracts_by_agent(agent_name)
         
         for contract in agent_contracts:
             if str(contract.get('CRM ID', '')) == str(crm_id):
@@ -93,9 +106,9 @@ class CRMData:
         
         return None
     
-    def search_contracts_by_client_name(self, client_name: str, agent_name: str) -> List[Dict]:
+    async def search_contracts_by_client_name(self, client_name: str, agent_name: str) -> List[Dict]:
         """Поиск контрактов по имени клиента (только для агента)"""
-        agent_contracts = self.get_contracts_by_agent(agent_name)
+        agent_contracts = await self.get_contracts_by_agent(agent_name)
         matching_contracts = []
         
         for contract in agent_contracts:
@@ -105,17 +118,19 @@ class CRMData:
         
         return matching_contracts
     
-    def update_contract(self, crm_id: str, updates: Dict) -> bool:
-        """Обновляет контракт через n8n"""
+    async def update_contract(self, crm_id: str, updates: Dict) -> bool:
+        """Обновляет контракт через n8n (async), стараясь не делать лишний GET"""
         try:
-            # Сначала получаем текущие данные контракта
-            all_contracts = self.get_all_contracts()
-            current_contract = None
+            # 1) Пытаемся получить контракт из кеша (любой агент)
+            current_contract: Optional[Dict] = cache_manager.find_contract_globally(crm_id)
             
-            for contract in all_contracts:
-                if str(contract.get('CRM ID', '')) == str(crm_id):
-                    current_contract = contract
-                    break
+            # 2) Если в кеше не нашли — делаем один запрос к API
+            if current_contract is None:
+                all_contracts = await self.get_all_contracts()
+                for contract in all_contracts:
+                    if str(contract.get('CRM ID', '')) == str(crm_id):
+                        current_contract = contract
+                        break
             
             if not current_contract:
                 logger.error(f"Контракт с CRM ID {crm_id} не найден")
@@ -153,17 +168,16 @@ class CRMData:
                 "priceUpdateTikTok": current_contract.get('Обновление цены в Тик ток', ''),
                 "priceUpdateMailing": current_contract.get('Обновление цены в рассылка', ''),
                 "priceUpdateStream": current_contract.get('Обновление цены в Стрим', ''),
-                "negotiations": current_contract.get('Переговоры', False),
-                "depositOrDeal": current_contract.get('Задаток/Сделка', False),
-                "completed": current_contract.get('Реализовано', False)
+                # объединенный статус
+                "status": current_contract.get('Статус объекта', current_contract.get('Статус', 'Размещено'))
             }
             
             # Применяем обновления
             update_data.update(updates)
             
             # Отправляем обновление
-            response = requests.post(N8N_WEBHOOK_URL, json=update_data)
-            
+            client = await self._get_client()
+            response = await client.post(N8N_WEBHOOK_URL, json=update_data)
             if response.status_code == 200:
                 # Обновляем кеш
                 normalized_agent_name = ' '.join(current_contract.get('МОП', '').strip().split())
@@ -174,18 +188,17 @@ class CRMData:
                     cache_manager.update_contract_in_cache(crm_id, normalized_agent_name, updates)
                 
                 return True
-            else:
-                return False
+            return False
             
         except Exception as e:
             logger.error(f"Ошибка при обновлении контракта: {e}")
             return False
     
-    def refresh_agent_cache(self, agent_name: str):
-        """Принудительно обновляет кеш для конкретного агента"""
+    async def refresh_agent_cache(self, agent_name: str):
+        """Принудительно обновляет кеш для конкретного агента (async)"""
         try:
             # Получаем свежие данные из API
-            all_contracts = self.get_all_contracts()
+            all_contracts = await self.get_all_contracts()
             
             # Фильтруем контракты для агента
             agent_contracts = []
@@ -204,6 +217,10 @@ class CRMData:
         except Exception as e:
             logger.error(f"Ошибка при обновлении кеша агента {agent_name}: {e}")
             return False
+
+    async def close(self):
+        if self._client:
+            await self._client.aclose()
 
 # Глобальный экземпляр CRM
 crm = CRMData()

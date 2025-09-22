@@ -20,6 +20,7 @@ def main():
             listen=WEBAPP_HOST,
             port=WEBAPP_PORT,
             webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+            url_path=WEBHOOK_PATH,
             secret_token=None,
         )
     else:

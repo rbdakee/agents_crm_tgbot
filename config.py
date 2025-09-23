@@ -19,5 +19,5 @@ LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'false').lower() == 'true'
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '')  # e.g., https://your.domain.tld/bot
 WEBAPP_HOST = os.getenv('WEBAPP_HOST', '0.0.0.0')
-WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', '8080'))
+WEBAPP_PORT = 8080 if os.getenv('WEBAPP_PORT') == '' else int(os.getenv('WEBAPP_PORT', '8080'))
 WEBHOOK_PATH = os.getenv('WEBHOOK_PATH', f"/{BOT_TOKEN}")

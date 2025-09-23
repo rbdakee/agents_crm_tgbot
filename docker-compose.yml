@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: agents_crm_bot
+    env_file:
+      - .env
+    command: ["python", "main.py"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # for webhook mode
+    volumes:
+      - ./cache.json:/app/cache.json
+      - ./data/agents.csv:/app/data/agents.csv:ro
+

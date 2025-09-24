@@ -43,6 +43,81 @@ def clean_client_name(client_info: str) -> str:
     return cleaned.strip()
 
 
+def get_status_value(contract: Dict) -> str:
+    value = contract.get('Статус объекта')
+    if isinstance(value, str):
+        value = value.strip()
+    if not value:
+        alt = contract.get('Статус')
+        if isinstance(alt, str):
+            alt = alt.strip()
+        value = alt or 'Размещено'
+    return value
+
+
+def build_pending_tasks(contract: Dict, status_value: str, analytics_mode_active: bool) -> List[str]:
+    pending: List[str] = []
+    # Базовые задачи
+    if not contract.get('Коллаж'):
+        pending.append("❌ Коллаж")
+    if contract.get('Коллаж') and not contract.get('Обновленный колаж'):
+        pending.append("❌ Проф Коллаж")
+
+    # Проверка наличия базовых ссылок первого этапа
+    def is_filled(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        return bool(value)
+
+    base_links_fields = [
+        ("Крыша", 'Загрузка на крышу'),
+        ("Инстаграм", 'Инстаграм'),
+        ("Тикток", 'Тик ток'),
+        ("Рассылка", 'Рассылка'),
+        ("Стрим", 'Стрим'),
+    ]
+    missing_base_links = [label for (label, field) in base_links_fields if not is_filled(contract.get(field))]
+    if missing_base_links:
+        pending.append("❌ Добавить ссылки: " + ", ".join(missing_base_links))
+
+    # Задачи по режимам/статусам
+    if status_value == 'Реализовано':
+        return pending
+
+    if analytics_mode_active:
+        if not contract.get('Аналитика'):
+            pending.append("❌ Аналитика")
+        elif not contract.get('Предоставление Аналитики через 5 дней'):
+            pending.append("❌ Аналитика через 5 дней")
+        if contract.get('Предоставление Аналитики через 5 дней') and not contract.get('Дожим на новую цену'):
+            pending.append("❌ Дожим")
+    elif status_value == 'Корректировка цены':
+        if not contract.get('Дожим на новую цену'):
+            pending.append("❌ Дожим")
+        # Добавляем задачу на обновление цены, только если поле пустое
+        if not str(contract.get('Корректировка цены', '')).strip():
+            pending.append("❌ Обновление цены")
+        # После корректировки цены — нужно добавить обновленные ссылки
+        updated_links_fields = [
+            ("Крыша", 'Обновление цены на крыше'),
+            ("Инстаграм", 'Обновление цены в инстаграм'),
+            ("Тикток", 'Обновление цены в Тик ток'),
+            ("Рассылка", 'Обновление цены в рассылка'),
+            ("Стрим", 'Обновление цены в Стрим'),
+        ]
+        missing_updated_links = [label for (label, field) in updated_links_fields if not is_filled(contract.get(field))]
+        if missing_updated_links:
+            pending.append("❌ Добавить обновленные ссылки: " + ", ".join(missing_updated_links))
+
+    # Если задач нет, и объект еще не реализован — подсказать сменить статус
+    if not pending and status_value != 'Реализовано':
+        pending.append("❌ Для следующего этапа смените Статус объекта")
+
+    return pending
+
+
 def get_agent_phone_by_name(agent_name: str) -> str:
     phone = crm.get_phone_by_agent(agent_name)
     return phone if phone else "N/A"
@@ -270,7 +345,7 @@ async def show_contract_detail(update: Update, context: ContextTypes.DEFAULT_TYP
     message += f"💰 Цена: {contract.get('Цена указанная в договоре', 'N/A')}\n"
     message += f"⏰ Истекает: {contract.get('Истекает', 'N/A')}\n"
     message += f"📊 Корректировка цены: {contract.get('Корректировка цены', 'N/A')}\n"
-    message += f"📌 Статус: {contract.get('Статус объекта', 'Размещено')}\n"
+    message += f"📌 Статус: {get_status_value(contract)}\n"
     message += f"👁️ Показы: {contract.get('Показ', 0)}\n\n"
 
     # Добавляем блок со ссылками, если есть
@@ -283,12 +358,31 @@ async def show_contract_detail(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     available_links = []
     for label, field in link_fields:
-        url = (contract.get(field) or '').strip()
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
         if url:
             safe_url = html.escape(url, quote=True)
             available_links.append(f"<a href=\"{safe_url}\">{label}</a>")
     if available_links:
         message += f"🔗 Ссылки: {', '.join(available_links)}\n\n"
+
+    # Добавляем блок с обновленными ссылками (после корректировки цены), если есть
+    updated_link_fields = [
+        ("Инстаграм", 'Обновление цены в инстаграм'),
+        ("Тикток", 'Обновление цены в Тик ток'),
+        ("Крыша", 'Обновление цены на крыше'),
+        ("Рассылка", 'Обновление цены в рассылка'),
+        ("Стрим", 'Обновление цены в Стрим'),
+    ]
+    available_updated_links = []
+    for label, field in updated_link_fields:
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
+        if url:
+            safe_url = html.escape(url, quote=True)
+            available_updated_links.append(f"<a href=\"{safe_url}\">{label}</a>")
+    if available_updated_links:
+        message += f"🔗 Обновленные ссылки: {', '.join(available_updated_links)}\n\n"
 
     if contract.get('Коллаж'):
         message += "✅ Коллаж\n"
@@ -302,8 +396,13 @@ async def show_contract_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         message += "✅ Дожим\n"
 
     # Рендер кнопок в зависимости от статуса
-    status_value = contract.get('Статус объекта', 'Размещено')
+    status_value = get_status_value(contract)
     analytics_mode_active = context.user_data.get('analytics_mode') == str(crm_id)
+
+    # Чек-лист невыполненных задач
+    pending = build_pending_tasks(contract, status_value, analytics_mode_active)
+    if pending:
+        message += "\n📝 Необходимо сделать:\n" + "\n".join(pending) + "\n"
 
     # Если реализовано — кнопок нет
     if status_value == 'Реализовано':
@@ -327,7 +426,8 @@ async def show_contract_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         # Кнопки для статуса "Корректировка цены"
         if not contract.get('Дожим на новую цену'):
             keyboard.append([InlineKeyboardButton("Дожим", callback_data=f"push_{crm_id}")])
-        keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
+        if not str(contract.get('Корректировка цены', '')).strip():
+            keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
         keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
         keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
     elif analytics_mode_active:
@@ -913,7 +1013,7 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     message += f"💰 Цена: {contract.get('Цена указанная в договоре', 'N/A')}\n"
     message += f"⏰ Истекает: {contract.get('Истекает', 'N/A')}\n"
     message += f"📊 Корректировка цены: {contract.get('Корректировка цены', 'N/A')}\n"
-    message += f"📌 Статус: {contract.get('Статус объекта', 'Размещено')}\n"
+    message += f"📌 Статус: {get_status_value(contract)}\n"
     message += f"👁️ Показы: {contract.get('Показ', 0)}\n\n"
 
     # Добавляем блок со ссылками, если есть
@@ -926,12 +1026,31 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     ]
     available_links = []
     for label, field in link_fields:
-        url = (contract.get(field) or '').strip()
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
         if url:
             safe_url = html.escape(url, quote=True)
             available_links.append(f"<a href=\"{safe_url}\">{label}</a>")
     if available_links:
         message += f"🔗 Ссылки: {', '.join(available_links)}\n\n"
+
+    # Добавляем блок с обновленными ссылками (после корректировки цены), если есть
+    updated_link_fields = [
+        ("Инстаграм", 'Обновление цены в инстаграм'),
+        ("Тикток", 'Обновление цены в Тик ток'),
+        ("Крыша", 'Обновление цены на крыше'),
+        ("Рассылка", 'Обновление цены в рассылка'),
+        ("Стрим", 'Обновление цены в Стрим'),
+    ]
+    available_updated_links = []
+    for label, field in updated_link_fields:
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
+        if url:
+            safe_url = html.escape(url, quote=True)
+            available_updated_links.append(f"<a href=\"{safe_url}\">{label}</a>")
+    if available_updated_links:
+        message += f"🔗 Обновленные ссылки: {', '.join(available_updated_links)}\n\n"
 
     if contract.get('Коллаж'):
         message += "✅ Коллаж\n"
@@ -944,7 +1063,13 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     if contract.get('Дожим на новую цену'):
         message += "✅ Дожим\n"
 
-    status_value = contract.get('Статус объекта', 'Размещено')
+    status_value = get_status_value(contract)
+    analytics_mode_active = context.user_data.get('analytics_mode') == str(crm_id)
+
+    # Чек-лист невыполненных задач
+    pending = build_pending_tasks(contract, status_value, analytics_mode_active)
+    if pending:
+        message += "\n📝 Необходимо сделать:\n" + "\n".join(pending) + "\n"
 
     if status_value == 'Реализовано':
         keyboard = [
@@ -969,7 +1094,8 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     if status_value == 'Корректировка цены':
         if not contract.get('Дожим на новую цену'):
             keyboard.append([InlineKeyboardButton("Дожим", callback_data=f"push_{crm_id}")])
-        keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
+        if not str(contract.get('Корректировка цены', '')).strip():
+            keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
         keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
         keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
     elif analytics_mode_active:

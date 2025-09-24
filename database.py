@@ -168,8 +168,12 @@ class CRMData:
                 "priceUpdateTikTok": current_contract.get('Обновление цены в Тик ток', ''),
                 "priceUpdateMailing": current_contract.get('Обновление цены в рассылка', ''),
                 "priceUpdateStream": current_contract.get('Обновление цены в Стрим', ''),
-                # объединенный статус
-                "status": current_contract.get('Статус объекта', current_contract.get('Статус', 'Размещено'))
+                # объединенный статус (нормализация пустого в 'Размещено')
+                "status": (
+                    (current_contract.get('Статус объекта') or current_contract.get('Статус') or 'Размещено').strip()
+                    if isinstance((current_contract.get('Статус объекта') or current_contract.get('Статус') or 'Размещено'), str)
+                    else (current_contract.get('Статус объекта') or current_contract.get('Статус') or 'Размещено')
+                )
             }
             
             # Применяем обновления

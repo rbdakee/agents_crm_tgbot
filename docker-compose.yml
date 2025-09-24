@@ -9,6 +9,6 @@ services:
     ports:
       - "8080:8080" # for webhook mode
     volumes:
-      - ./cache.json:/app/cache.json
+      - ./data/cache.json:/app/data/cache.json
       - ./data/agents.csv:/app/data/agents.csv:ro
 

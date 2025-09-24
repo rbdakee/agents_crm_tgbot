@@ -7,7 +7,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class CacheManager:
-    def __init__(self, cache_file: str = "cache.json"):
+    def __init__(self, cache_file: str = "data/cache.json"):
         self.cache_file = cache_file
         self.cache_ttl = 30 * 60  # 30 минут в секундах
     
@@ -24,6 +24,7 @@ class CacheManager:
     def _save_cache(self, cache_data: Dict):
         """Сохраняет кеш в файл"""
         try:
+            os.makedirs(os.path.dirname(self.cache_file) or '.', exist_ok=True)
             with open(self.cache_file, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
         except Exception as e:

@@ -101,7 +101,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[user_id] = 'waiting_phone'
 
             await update.message.reply_text(
-                "Добро пожаловать в CRM систему!\n\n"
+                "Добро пожаловать!\n\n"
                 "Для входа в систему введите ваш номер телефона в формате:\n"
                 "87777777777"
             )
@@ -120,7 +120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_states[user_id] = 'waiting_phone'
         await update.message.reply_text(
-            "Добро пожаловать в CRM систему!\n\n"
+            "Добро пожаловать!\n\n"
             "Для входа в систему введите ваш номер телефона в формате:\n"
             "87777777777"
         )

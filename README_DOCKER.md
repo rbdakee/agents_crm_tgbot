@@ -33,5 +33,5 @@ docker compose up -d
 
 ### Notes
 - The file `data/agents.csv` is mounted read-only into the container.
-- `cache.json` is mounted for persistence between restarts.
+- `data/cache.json` is mounted for persistence between restarts.
 - Requirements: Docker Engine 20+, Docker Compose v2.

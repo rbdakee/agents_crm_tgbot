@@ -257,6 +257,9 @@ async def show_contracts_page(query, contracts: List[Dict], page: int):
         message += f"Истекает: {expires}\n"
         message += "-"*30 + "\n\n"
 
+        # Добавляем кнопку для быстрого перехода к карточке контракта
+        keyboard.append([InlineKeyboardButton(f"CRM iD: {crm_id}", callback_data=f"contract_{crm_id}")])
+
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"prev_page_{page}"))
@@ -296,6 +299,9 @@ async def show_search_results_page(message_or_query, contracts: List[Dict], page
         message_text += f"Адрес: {address}\n"
         message_text += f"Истекает: {expires}\n"
         message_text += "-"*30 + "\n\n"
+
+        # Кнопка для показа карточки контракта из результатов поиска
+        keyboard.append([InlineKeyboardButton(f"CRM iD: {crm_id}", callback_data=f"contract_{crm_id}")])
 
     nav_buttons = []
     if page > 0:

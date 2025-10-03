@@ -1,4 +1,7 @@
 import logging
+import asyncio
+import os
+import uuid
 import re
 import html
 from typing import Dict, List
@@ -15,6 +18,8 @@ from telegram.ext import (
 
 from config import BOT_USERNAME, CONTRACTS_PER_PAGE
 from database import crm
+from collage import CollageInput, render_collage_to_image
+from api_client import get_collage_data_from_api
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +31,15 @@ user_search_results: Dict[int, List[Dict]] = {}
 user_current_search_page: Dict[int, int] = {}
 user_last_messages: Dict[int, object] = {}
 
+# Temporary storage of collage building state per user
+user_collage_inputs: Dict[int, CollageInput] = {}
+user_pending_downloads: Dict[int, int] = {}
+
 
 # Utilities
 PHONE_CLEAN_RE = re.compile(r"[\d\+\-\(\)\s]+")
+# Регулярное выражение для очистки имени клиента - оставляем только буквы, пробелы, дефисы и апострофы
+NAME_CLEAN_RE = re.compile(r"[^а-яёА-ЯЁa-zA-Z\s\-\']+", re.UNICODE)
 
 async def show_loading(query) -> None:
     try:
@@ -38,8 +49,22 @@ async def show_loading(query) -> None:
 
 
 def clean_client_name(client_info: str) -> str:
+    """Очищает имя клиента, оставляя только буквы, пробелы, дефисы и апострофы"""
+    if not client_info:
+        return ""
+    
+    # Сначала убираем номера телефонов
     cleaned = PHONE_CLEAN_RE.sub(" ", client_info)
+    
+    # Затем убираем все символы кроме букв, пробелов, дефисов и апострофов
+    cleaned = NAME_CLEAN_RE.sub("", cleaned)
+    
+    # Убираем лишние пробелы и приводим к нормальному виду
     cleaned = " ".join(cleaned.split())
+    
+    # Убираем лишние дефисы и апострофы в начале/конце
+    cleaned = cleaned.strip(" -'")
+    
     return cleaned.strip()
 
 
@@ -177,8 +202,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(
                 "Добро пожаловать!\n\n"
-                "Для входа в систему введите ваш номер телефона в формате:\n"
-                "87777777777"
+                "Для входа в систему введите ваш номер телефона:"
             )
         return
 
@@ -196,8 +220,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = 'waiting_phone'
         await update.message.reply_text(
             "Добро пожаловать!\n\n"
-            "Для входа в систему введите ваш номер телефона в формате:\n"
-            "87777777777"
+            "Для входа в систему введите ваш номер телефона:"
         )
 
 
@@ -423,7 +446,7 @@ async def show_contract_detail(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = []
     # Общие правила на коллаж/проф/показ
     if not contract.get('Коллаж'):
-        keyboard.append([InlineKeyboardButton("Коллаж", callback_data=f"action_collage_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Создать коллаж", callback_data=f"collage_build_{crm_id}")])
     if contract.get('Коллаж') and not contract.get('Обновленный колаж'):
         keyboard.append([InlineKeyboardButton("Проф коллаж", callback_data=f"action_pro_collage_{crm_id}")])
     keyboard.append([InlineKeyboardButton("Показ +1", callback_data=f"action_show_{crm_id}")])
@@ -506,24 +529,185 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_search_results_page(query, contracts, page + 1, client_name)
         user_current_search_page[user_id] = page + 1
 
-    elif data.startswith("action_collage_"):
-        crm_id = data.replace("action_collage_", "")
+    elif data.startswith("collage_build_"):
+        crm_id = data.replace("collage_build_", "")
+        user_id = update.effective_user.id
         await show_loading(query)
+        await query.edit_message_text("Получаю данные из CRM...")
+        
+        try:
+            # Получаем данные из API
+            collage_input = await get_collage_data_from_api(crm_id)
+            if not collage_input:
+                await query.edit_message_text("❌ Не удалось получить данные из CRM. Проверьте CRM ID.")
+                return
+            
+            # Получаем имя клиента из кеша n8n
+            agent_name = context.user_data.get('agent_name')
+            if agent_name:
+                contract = await crm.search_contract_by_crm_id(crm_id, agent_name)
+                if contract and contract.get('Имя клиента и номер'):
+                    client_info = contract['Имя клиента и номер']
+                    # Извлекаем только имя клиента (до двоеточия) и очищаем от лишних символов
+                    raw_client_name = client_info.split(':')[0].strip()
+                    client_name = clean_client_name(raw_client_name)
+                    collage_input.client_name = client_name
+            
+            # Сохраняем данные для пользователя
+            user_collage_inputs[user_id] = collage_input
+            
+            # Показываем данные коллажа с кнопками редактирования
+            await show_collage_data_with_edit_buttons(query, collage_input, crm_id)
+        except Exception as e:
+            logger.error(f"Error getting collage data from API: {e}")
+            await query.edit_message_text("❌ Ошибка при получении данных из CRM. Попробуйте позже.")
+
+    elif data.startswith("collage_proceed_"):
+        crm_id = data.replace("collage_proceed_", "")
+        user_id = update.effective_user.id
+        user_states[user_id] = f'waiting_collage_photos_{crm_id}'
+        
+        await query.edit_message_text(
+            f"📸 Теперь отправьте фотографии для коллажа (1-5 штук).\n"
+            f"После отправки всех фото напишите 'Готово'.\n\n"
+            f"Вы можете ввести 'отмена' чтобы прервать."
+        )
+
+    elif data.startswith("edit_collage_"):
+        # Обработка редактирования полей коллажа
+        parts = data.replace("edit_collage_", "").split("_")
+        field = parts[0]
+        crm_id = parts[1]
+        user_id = update.effective_user.id
+        
+        field_names = {
+            'client': 'имя клиента',
+            'complex': 'название ЖК',
+            'address': 'адрес',
+            'area': 'площадь',
+            'rooms': 'количество комнат',
+            'floor': 'этаж',
+            'price': 'цену',
+            'class': 'класс жилья',
+            'rop': 'имя РОП',
+            'phone': 'номер телефона агента',
+            'benefits': 'достоинства'
+        }
+        
+        field_name = field_names.get(field, field)
+        user_states[user_id] = f'editing_collage_{field}_{crm_id}'
+        
+        if field == 'benefits':
+            ci = user_collage_inputs.get(user_id)
+            if ci and ci.benefits:
+                benefits_text = "\n".join([f"{i+1}. {benefit}" for i, benefit in enumerate(ci.benefits)])
+                await query.edit_message_text(
+                    f"📋 Текущие достоинства:\n{benefits_text}\n\n"
+                    f"Введите новые достоинства (каждое с новой строки) или 'отмена' для возврата:"
+                )
+            else:
+                await query.edit_message_text(
+                    f"📋 Достоинства не заданы.\n\n"
+                    f"Введите достоинства (каждое с новой строки) или 'отмена' для возврата:"
+                )
+        else:
+            await query.edit_message_text(
+                f"✏️ Введите новое значение для поля '{field_name}' или 'отмена' для возврата:"
+            )
+
+    elif data.startswith("collage_save_"):
+        crm_id = data.replace("collage_save_", "")
+        
+        # Редактируем caption фотографии
+        try:
+            await query.edit_message_caption(caption="Коллаж сохранен!")
+        except Exception:
+            await query.answer("Коллаж сохранен!")
+        
         success = await crm.update_contract(crm_id, {"collage": True})
         if success:
-            await query.answer("Коллаж отмечен как выполненный")
             agent_name = context.user_data.get('agent_name')
             if agent_name:
                 await crm.refresh_agent_cache(agent_name)
                 contract = await crm.search_contract_by_crm_id(crm_id, agent_name)
                 if contract:
-                    await show_contract_detail_by_contract(update, context, contract)
+                    # Отправляем новое сообщение с деталями объекта напрямую
+                    await send_contract_detail_directly(update.effective_chat, context, contract)
                 else:
-                    await query.edit_message_text("Контракт не найден")
+                    await update.effective_chat.send_message("Контракт не найден")
             else:
-                await query.edit_message_text("Ошибка: агент не найден")
+                await update.effective_chat.send_message("Ошибка: агент не найден")
         else:
-            await query.answer("Ошибка при обновлении", show_alert=True)
+            await query.answer("Ошибка при сохранении", show_alert=True)
+
+    elif data.startswith("collage_redo_"):
+        crm_id = data.replace("collage_redo_", "")
+        user_id = update.effective_user.id
+        
+        # Редактируем caption фотографии
+        try:
+            await query.edit_message_caption(caption="Коллаж переделывается...")
+        except Exception:
+            await query.answer("Коллаж переделывается...")
+        
+        try:
+            # Получаем данные из API заново
+            collage_input = await get_collage_data_from_api(crm_id)
+            if not collage_input:
+                await update.effective_chat.send_message("❌ Не удалось получить данные из CRM. Проверьте CRM ID.")
+                return
+            
+            # Получаем имя клиента из кеша n8n
+            agent_name = context.user_data.get('agent_name')
+            if agent_name:
+                contract = await crm.search_contract_by_crm_id(crm_id, agent_name)
+                if contract and contract.get('Имя клиента и номер'):
+                    client_info = contract['Имя клиента и номер']
+                    # Извлекаем только имя клиента (до двоеточия) и очищаем от лишних символов
+                    raw_client_name = client_info.split(':')[0].strip()
+                    client_name = clean_client_name(raw_client_name)
+                    collage_input.client_name = client_name
+            
+            # Сохраняем данные для пользователя
+            user_collage_inputs[user_id] = collage_input
+            
+            # Создаем фиктивный query объект для отправки нового сообщения
+            class FakeQuery:
+                async def edit_message_text(self, text, reply_markup=None):
+                    await update.effective_chat.send_message(text, reply_markup=reply_markup)
+            
+            fake_query = FakeQuery()
+            # Показываем данные коллажа с кнопками редактирования
+            await show_collage_data_with_edit_buttons(fake_query, collage_input, crm_id)
+        except Exception as e:
+            logger.error(f"Error getting collage data from API: {e}")
+            await update.effective_chat.send_message("❌ Ошибка при получении данных из CRM. Попробуйте позже.")
+
+    elif data.startswith("collage_cancel_"):
+        crm_id = data.replace("collage_cancel_", "")
+        user_id = update.effective_user.id
+        
+        # Очищаем данные коллажа пользователя
+        user_collage_inputs.pop(user_id, None)
+        user_states[user_id] = 'authenticated'
+        
+        # Редактируем caption фотографии
+        try:
+            await query.edit_message_caption(caption="Создание отменено.")
+        except Exception:
+            await query.answer("Создание отменено.")
+        
+        # Возвращаемся к деталям объекта
+        agent_name = context.user_data.get('agent_name')
+        if agent_name:
+            contract = await crm.search_contract_by_crm_id(crm_id, agent_name)
+            if contract:
+                # Отправляем новое сообщение с деталями объекта напрямую
+                await send_contract_detail_directly(update.effective_chat, context, contract)
+            else:
+                await update.effective_chat.send_message("Контракт не найден")
+        else:
+            await update.effective_chat.send_message("Ошибка: агент не найден")
 
     elif data.startswith("action_pro_collage_"):
         crm_id = data.replace("action_pro_collage_", "")
@@ -920,28 +1104,188 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         user_states[user_id] = 'authenticated'
 
+    elif state.startswith('waiting_collage_photos_'):
+        text = update.message.text.strip()
+        if text.lower() == 'отмена':
+            user_states[user_id] = 'authenticated'
+            user_collage_inputs.pop(user_id, None)
+            await update.message.reply_text('Создание коллажа отменено.')
+            return
+        
+        # User should send 'Готово' to finish
+        if text.lower() in ('готово', 'готово.', 'готов'):            
+            crm_id = state.replace('waiting_collage_photos_', '')
+            ci = user_collage_inputs.get(user_id)
+            if not ci or not ci.photos:
+                await update.message.reply_text('Не получено фото. Пожалуйста отправьте хотя бы одно фото или введите Отмена.')
+                return
+            status_msg = await update.message.reply_text('Создаю коллаж, подождите...')
+            
+            def _cleanup_files():
+                try:
+                    # Удаляем итоговый PNG и временный HTML
+                    png_path = os.path.join('data', f"collage_{ci.crm_id}.png")
+                    html_path = os.path.join('data', f"collage_{ci.crm_id}.html")
+                    for p in [png_path, html_path]:
+                        try:
+                            if os.path.exists(p):
+                                os.remove(p)
+                        except Exception:
+                            logger.exception('Failed to remove temp file %s', p)
+                    # Удаляем загруженные пользователем фото
+                    for p in list(ci.photos or []):
+                        try:
+                            if os.path.exists(p):
+                                os.remove(p)
+                        except Exception:
+                            logger.exception('Failed to remove user photo %s', p)
+                except Exception:
+                    logger.exception('Cleanup error')
+
+            async def _render_and_send():
+                image_path = await render_collage_to_image(ci)
+                
+                # Создаем кнопки для действий с коллажем
+                keyboard = [
+                    [InlineKeyboardButton("✅ Сохранить Коллаж", callback_data=f"collage_save_{crm_id}")],
+                    [InlineKeyboardButton("🔄 Переделать", callback_data=f"collage_redo_{crm_id}")],
+                    [InlineKeyboardButton("❌ Отменить создание", callback_data=f"collage_cancel_{crm_id}")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                # Попытки отправки с повторами при сетевых ошибках
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        with open(image_path, 'rb') as f:
+                            await update.message.reply_photo(
+                                photo=f, 
+                                caption='Коллаж готов! Выберите действие:',
+                                reply_markup=reply_markup,
+                                read_timeout=60,  # Увеличиваем тайм-аут для загрузки
+                                write_timeout=60
+                            )
+                        break  # Успешно отправлено
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            # Последняя попытка не удалась
+                            logger.error(f"Failed to send collage after {max_retries} attempts: {e}")
+                            await update.message.reply_text(
+                                f"❌ Коллаж создан, но не удалось отправить из-за проблем с сетью.\n"
+                                f"Попробуйте создать коллаж еще раз."
+                            )
+                            raise
+                        else:
+                            logger.warning(f"Attempt {attempt + 1} failed, retrying: {e}")
+                            await asyncio.sleep(2)  # Пауза перед повтором
+                
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            
+            try:
+                await asyncio.wait_for(_render_and_send(), timeout=180)  # Увеличиваем общий тайм-аут
+            except asyncio.TimeoutError:
+                try:
+                    await status_msg.edit_text('⏰ Не удалось создать коллаж за 3 минуты. Попробуйте ещё раз.')
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.exception('Collage render/send failed')
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                
+                # Определяем тип ошибки для более точного сообщения
+                error_msg = "❌ Ошибка при создании коллажа."
+                if "TimedOut" in str(e) or "ReadTimeout" in str(e) or "SSLWantReadError" in str(e):
+                    error_msg = "🌐 Проблемы с сетью при отправке коллажа. Проверьте интернет-соединение и попробуйте еще раз."
+                elif "SSL" in str(e):
+                    error_msg = "🔒 Проблемы с SSL-соединением. Попробуйте еще раз через несколько минут."
+                
+                await update.message.reply_text(f"{error_msg}\n\nПопробуйте еще раз.")
+            finally:
+                _cleanup_files()
+            
+            # cleanup
+            user_states[user_id] = 'authenticated'
+            user_collage_inputs.pop(user_id, None)
+            return
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_states.get(user_id, '')
     if state == 'waiting_phone':
         await handle_phone(update, context)
-    elif state.startswith('waiting_price_') or state.startswith('waiting_link_'):
+    elif state.startswith('waiting_price_') or state.startswith('waiting_link_') or state.startswith('waiting_collage_photos_'):
         await handle_price_input(update, context)
+    elif state.startswith('editing_collage_'):
+        await handle_collage_edit(update, context)
     elif state == 'waiting_client_search':
         await handle_client_search(update, context)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_states.get(user_id, '')
+    if not state.startswith('waiting_collage_photos_'):
+        return
+    ci = user_collage_inputs.get(user_id)
+    if not ci:
+        return
+    try:
+        user_pending_downloads[user_id] = user_pending_downloads.get(user_id, 0) + 1
+        photo_sizes = update.message.photo
+        if not photo_sizes:
+            return
+        # get best resolution
+        file_id = photo_sizes[-1].file_id
+        file = await context.bot.get_file(file_id)
+        photos_dir = os.path.join('data')
+        os.makedirs(photos_dir, exist_ok=True)
+        local_path = os.path.join(photos_dir, f"collage_{uuid.uuid4().hex}.jpg")
+        await file.download_to_drive(local_path)
+        if not ci.photos:
+            ci.photos = []
+        if len(ci.photos) < 5:
+            ci.photos.append(local_path)
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось сохранить фото: {e}")
+    finally:
+        user_pending_downloads[user_id] = max(0, user_pending_downloads.get(user_id, 1) - 1)
 
 
 async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_states.get(user_id) != 'waiting_phone':
         return
+    
     phone = update.message.text.strip()
-    agent_name = crm.get_agent_by_phone(phone)
+    
+    # Проверяем валидность номера телефона
+    if not crm.is_valid_phone(phone):
+        await update.message.reply_text(
+            "❌ Неверный формат номера телефона.\n\n"
+            "Пожалуйста, введите номер в одном из форматов:\n"
+            "• 87777777777\n"
+            "• +77777777777\n"
+            "• 7777777777\n"
+            "• 8777777777\n\n"
+            "Номер должен содержать 10-11 цифр и начинаться с 8 или 7."
+        )
+        return
+    
+    # Нормализуем номер для поиска
+    normalized_phone = crm.normalize_phone(phone)
+    agent_name = crm.get_agent_by_phone(normalized_phone)
+    
     if agent_name:
         user_states[user_id] = 'authenticated'
         context.user_data['agent_name'] = agent_name
-        context.user_data['phone'] = phone
+        context.user_data['phone'] = normalized_phone
         reply_markup = build_main_menu_keyboard()
         pending_crm_id = context.user_data.get('pending_crm_id')
         if pending_crm_id:
@@ -970,8 +1314,10 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     else:
         await update.message.reply_text(
-            "Номер телефона не найден в системе. "
-            "Пожалуйста, проверьте правильность ввода или обратитесь к администратору."
+            "❌ Номер телефона не найден в системе.\n\n"
+            "Пожалуйста, проверьте правильность ввода или обратитесь к администратору.\n\n"
+            f"Введенный номер: {phone}\n"
+            f"Нормализованный: {normalized_phone}"
         )
 
 
@@ -1004,6 +1350,212 @@ async def handle_client_search(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=reply_markup,
         )
     user_states[user_id] = 'authenticated'
+
+
+async def send_contract_detail_directly(chat, context: ContextTypes.DEFAULT_TYPE, contract: Dict):
+    """Отправляет новое сообщение с деталями контракта напрямую в чат"""
+    crm_id = contract.get('CRM ID', 'N/A')
+    message = f"📋 Детали объекта CRM ID: {crm_id}\n\n"
+    message += f"📅 Дата подписания: {contract.get('Дата подписания', 'N/A')}\n"
+    message += f"👤 МОП: {contract.get('МОП', 'N/A')}\n"
+    message += f"👤 РОП: {contract.get('РОП', 'N/A')}\n"
+    client_info = contract.get('Имя клиента и номер', 'N/A')
+    client_name = clean_client_name(client_info) if client_info != 'N/A' else 'N/A'
+    message += f"📞 Клиент: {client_name}\n"
+    message += f"🏠 Адрес: {contract.get('Адрес', 'N/A')}\n"
+    message += f"💰 Цена: {contract.get('Цена указанная в договоре', 'N/A')}\n"
+    message += f"⏰ Истекает: {contract.get('Истекает', 'N/A')}\n"
+    message += f"📊 Корректировка цены: {contract.get('Корректировка цены', 'N/A')}\n"
+    message += f"📌 Статус: {get_status_value(contract)}\n"
+    message += f"👁️ Показы: {contract.get('Показ', 0)}\n\n"
+
+    # Добавляем блок со ссылками, если есть
+    link_fields = [
+        ("Инстаграм", 'Инстаграм'),
+        ("Тикток", 'Тик ток'),
+        ("Крыша", 'Загрузка на крышу'),
+        ("Рассылка", 'Рассылка'),
+        ("Стрим", 'Стрим'),
+    ]
+    available_links = []
+    for label, field in link_fields:
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
+        if url:
+            safe_url = html.escape(url, quote=True)
+            available_links.append(f"<a href=\"{safe_url}\">{label}</a>")
+    if available_links:
+        message += f"🔗 Ссылки: {', '.join(available_links)}\n\n"
+
+    # Добавляем блок с обновленными ссылками (после корректировки цены), если есть
+    updated_link_fields = [
+        ("Инстаграм", 'Обновление цены в инстаграм'),
+        ("Тикток", 'Обновление цены в Тик ток'),
+        ("Крыша", 'Обновление цены на крыше'),
+        ("Рассылка", 'Обновление цены в рассылка'),
+        ("Стрим", 'Обновление цены в Стрим'),
+    ]
+    available_updated_links = []
+    for label, field in updated_link_fields:
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
+        if url:
+            safe_url = html.escape(url, quote=True)
+            available_updated_links.append(f"<a href=\"{safe_url}\">{label}</a>")
+    if available_updated_links:
+        message += f"🔗 Обновленные ссылки: {', '.join(available_updated_links)}\n\n"
+
+    if contract.get('Коллаж'):
+        message += "✅ Коллаж\n"
+    if contract.get('Обновленный колаж'):
+        message += "✅ Проф Коллаж\n"
+    if contract.get('Аналитика'):
+        message += "✅ Аналитика-сделано\n"
+    if contract.get('Предоставление Аналитики через 5 дней'):
+        message += "✅ Аналитика-предоставлено\n"
+    if contract.get('Дожим на новую цену'):
+        message += "✅ Дожим\n"
+
+    status_value = get_status_value(contract)
+    analytics_mode_active = context.user_data.get('analytics_mode') == str(crm_id)
+
+    # Чек-лист невыполненных задач
+    pending = build_pending_tasks(contract, status_value, analytics_mode_active)
+    if pending:
+        message += "\n📝 Необходимо сделать:\n" + "\n".join(pending) + "\n"
+
+    # Создаем кнопки
+    keyboard = []
+    if not contract.get('Коллаж'):
+        keyboard.append([InlineKeyboardButton("Создать коллаж", callback_data=f"collage_build_{crm_id}")])
+    if contract.get('Коллаж') and not contract.get('Обновленный колаж'):
+        keyboard.append([InlineKeyboardButton("Проф коллаж", callback_data=f"action_pro_collage_{crm_id}")])
+    keyboard.append([InlineKeyboardButton("Показ +1", callback_data=f"action_show_{crm_id}")])
+
+    if status_value == 'Корректировка цены':
+        if not contract.get('Дожим на новую цену'):
+            keyboard.append([InlineKeyboardButton("Дожим", callback_data=f"push_{crm_id}")])
+        if not str(contract.get('Корректировка цены', '')).strip():
+            keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
+    elif analytics_mode_active:
+        if not contract.get('Аналитика'):
+            keyboard.append([InlineKeyboardButton("Аналитика сделано", callback_data=f"analytics_done_{crm_id}")])
+        if not contract.get('Предоставление Аналитики через 5 дней'):
+            keyboard.append([InlineKeyboardButton("Аналитика предоставлено", callback_data=f"analytics_provided_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Выйти из режима аналитики", callback_data=f"exit_analytics_{crm_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад к списку", callback_data="my_contracts")])
+    keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await chat.send_message(message, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def send_contract_detail_message(update: Update, context: ContextTypes.DEFAULT_TYPE, contract: Dict):
+    """Отправляет новое сообщение с деталями контракта"""
+    crm_id = contract.get('CRM ID', 'N/A')
+    message = f"📋 Детали объекта CRM ID: {crm_id}\n\n"
+    message += f"📅 Дата подписания: {contract.get('Дата подписания', 'N/A')}\n"
+    message += f"👤 МОП: {contract.get('МОП', 'N/A')}\n"
+    message += f"👤 РОП: {contract.get('РОП', 'N/A')}\n"
+    client_info = contract.get('Имя клиента и номер', 'N/A')
+    client_name = clean_client_name(client_info) if client_info != 'N/A' else 'N/A'
+    message += f"📞 Клиент: {client_name}\n"
+    message += f"🏠 Адрес: {contract.get('Адрес', 'N/A')}\n"
+    message += f"💰 Цена: {contract.get('Цена указанная в договоре', 'N/A')}\n"
+    message += f"⏰ Истекает: {contract.get('Истекает', 'N/A')}\n"
+    message += f"📊 Корректировка цены: {contract.get('Корректировка цены', 'N/A')}\n"
+    message += f"📌 Статус: {get_status_value(contract)}\n"
+    message += f"👁️ Показы: {contract.get('Показ', 0)}\n\n"
+
+    # Добавляем блок со ссылками, если есть
+    link_fields = [
+        ("Инстаграм", 'Инстаграм'),
+        ("Тикток", 'Тик ток'),
+        ("Крыша", 'Загрузка на крышу'),
+        ("Рассылка", 'Рассылка'),
+        ("Стрим", 'Стрим'),
+    ]
+    available_links = []
+    for label, field in link_fields:
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
+        if url:
+            safe_url = html.escape(url, quote=True)
+            available_links.append(f"<a href=\"{safe_url}\">{label}</a>")
+    if available_links:
+        message += f"🔗 Ссылки: {', '.join(available_links)}\n\n"
+
+    # Добавляем блок с обновленными ссылками (после корректировки цены), если есть
+    updated_link_fields = [
+        ("Инстаграм", 'Обновление цены в инстаграм'),
+        ("Тикток", 'Обновление цены в Тик ток'),
+        ("Крыша", 'Обновление цены на крыше'),
+        ("Рассылка", 'Обновление цены в рассылка'),
+        ("Стрим", 'Обновление цены в Стрим'),
+    ]
+    available_updated_links = []
+    for label, field in updated_link_fields:
+        value = contract.get(field)
+        url = value.strip() if isinstance(value, str) else ''
+        if url:
+            safe_url = html.escape(url, quote=True)
+            available_updated_links.append(f"<a href=\"{safe_url}\">{label}</a>")
+    if available_updated_links:
+        message += f"🔗 Обновленные ссылки: {', '.join(available_updated_links)}\n\n"
+
+    if contract.get('Коллаж'):
+        message += "✅ Коллаж\n"
+    if contract.get('Обновленный колаж'):
+        message += "✅ Проф Коллаж\n"
+    if contract.get('Аналитика'):
+        message += "✅ Аналитика-сделано\n"
+    if contract.get('Предоставление Аналитики через 5 дней'):
+        message += "✅ Аналитика-предоставлено\n"
+    if contract.get('Дожим на новую цену'):
+        message += "✅ Дожим\n"
+
+    status_value = get_status_value(contract)
+    analytics_mode_active = context.user_data.get('analytics_mode') == str(crm_id)
+
+    # Чек-лист невыполненных задач
+    pending = build_pending_tasks(contract, status_value, analytics_mode_active)
+    if pending:
+        message += "\n📝 Необходимо сделать:\n" + "\n".join(pending) + "\n"
+
+    # Создаем кнопки
+    keyboard = []
+    if not contract.get('Коллаж'):
+        keyboard.append([InlineKeyboardButton("Создать коллаж", callback_data=f"collage_build_{crm_id}")])
+    if contract.get('Коллаж') and not contract.get('Обновленный колаж'):
+        keyboard.append([InlineKeyboardButton("Проф коллаж", callback_data=f"action_pro_collage_{crm_id}")])
+    keyboard.append([InlineKeyboardButton("Показ +1", callback_data=f"action_show_{crm_id}")])
+
+    if status_value == 'Корректировка цены':
+        if not contract.get('Дожим на новую цену'):
+            keyboard.append([InlineKeyboardButton("Дожим", callback_data=f"push_{crm_id}")])
+        if not str(contract.get('Корректировка цены', '')).strip():
+            keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
+    elif analytics_mode_active:
+        if not contract.get('Аналитика'):
+            keyboard.append([InlineKeyboardButton("Аналитика сделано", callback_data=f"analytics_done_{crm_id}")])
+        if not contract.get('Предоставление Аналитики через 5 дней'):
+            keyboard.append([InlineKeyboardButton("Аналитика предоставлено", callback_data=f"analytics_provided_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Выйти из режима аналитики", callback_data=f"exit_analytics_{crm_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад к списку", callback_data="my_contracts")])
+    keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.effective_chat.send_message(message, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def show_contract_detail_by_contract(update: Update, context: ContextTypes.DEFAULT_TYPE, contract: Dict):
@@ -1091,7 +1643,7 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
 
     keyboard = []
     if not contract.get('Коллаж'):
-        keyboard.append([InlineKeyboardButton("Коллаж", callback_data=f"action_collage_{crm_id}")])
+        keyboard.append([InlineKeyboardButton("Создать коллаж", callback_data=f"collage_build_{crm_id}")])
     if contract.get('Коллаж') and not contract.get('Обновленный колаж'):
         keyboard.append([InlineKeyboardButton("Проф коллаж", callback_data=f"action_pro_collage_{crm_id}")])
     keyboard.append([InlineKeyboardButton("Показ +1", callback_data=f"action_show_{crm_id}")])
@@ -1129,10 +1681,143 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
         user_last_messages[user_id] = sent_message
 
 
+async def handle_collage_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает редактирование полей коллажа"""
+    user_id = update.effective_user.id
+    state = user_states.get(user_id, '')
+    text = update.message.text.strip()
+    
+    if text.lower() == 'отмена':
+        # Возвращаемся к показу данных коллажа
+        parts = state.replace('editing_collage_', '').split('_')
+        crm_id = parts[1]
+        ci = user_collage_inputs.get(user_id)
+        if ci:
+            user_states[user_id] = 'authenticated'
+            # Создаем фиктивный query объект для показа данных
+            class FakeQuery:
+                async def edit_message_text(self, text, reply_markup=None):
+                    await update.message.reply_text(text, reply_markup=reply_markup)
+            
+            fake_query = FakeQuery()
+            await show_collage_data_with_edit_buttons(fake_query, ci, crm_id)
+        return
+    
+    # Извлекаем поле и crm_id из состояния
+    parts = state.replace('editing_collage_', '').split('_')
+    field = parts[0]
+    crm_id = parts[1]
+    
+    ci = user_collage_inputs.get(user_id)
+    if not ci:
+        await update.message.reply_text("❌ Данные коллажа не найдены. Начните заново.")
+        user_states[user_id] = 'authenticated'
+        return
+    
+    # Обновляем соответствующее поле
+    if field == 'client':
+        ci.client_name = text
+    elif field == 'complex':
+        ci.complex_name = text
+    elif field == 'address':
+        ci.address = text
+    elif field == 'area':
+        ci.area_sqm = text
+    elif field == 'rooms':
+        ci.rooms = text
+    elif field == 'floor':
+        ci.floor = text
+    elif field == 'price':
+        ci.price = text
+    elif field == 'class':
+        ci.housing_class = text
+    elif field == 'rop':
+        ci.rop = text
+    elif field == 'phone':
+        ci.agent_phone = text
+    elif field == 'benefits':
+        # Разбиваем текст на строки и очищаем от пустых
+        benefits = [line.strip() for line in text.split('\n') if line.strip()]
+        ci.benefits = benefits
+    
+    # Сохраняем обновленные данные
+    user_collage_inputs[user_id] = ci
+    user_states[user_id] = 'authenticated'
+    
+    # Показываем обновленные данные
+    class FakeQuery:
+        async def edit_message_text(self, text, reply_markup=None):
+            await update.message.reply_text(text, reply_markup=reply_markup)
+    
+    fake_query = FakeQuery()
+    await show_collage_data_with_edit_buttons(fake_query, ci, crm_id)
+
+
+async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput, crm_id: str):
+    """Показывает данные коллажа с кнопками для редактирования"""
+    
+    # Формируем сообщение с данными
+    message = f"✅ Данные для коллажа:\n\n"
+    message += f"👤 Клиент: {collage_input.client_name or 'Не указан'}\n"
+    message += f"🏢 ЖК: {collage_input.complex_name}\n"
+    message += f"📍 Адрес: {collage_input.address}\n"
+    message += f"📐 Площадь: {collage_input.area_sqm} м²\n"
+    message += f"🏠 Комнат: {collage_input.rooms}\n"
+    message += f"🏗️ Этаж: {collage_input.floor}\n"
+    message += f"💰 Цена: {collage_input.price}\n"
+    message += f"🏗️ Класс жилья: {collage_input.housing_class}\n"
+    message += f"👤 РОП: {collage_input.rop}\n"
+    message += f"📞 Телефон агента: {collage_input.agent_phone or 'Не указан'}\n\n"
+    
+    # Достоинства
+    if collage_input.benefits:
+        message += f"📋 Достоинства ({len(collage_input.benefits)} шт.):\n"
+        for i, benefit in enumerate(collage_input.benefits, 1):
+            message += f"   {i}. {benefit}\n"
+        message += "\n"
+    
+    # Создаем кнопки для редактирования
+    keyboard = [
+        [
+            InlineKeyboardButton("👤 Клиент", callback_data=f"edit_collage_client_{crm_id}"),
+            InlineKeyboardButton("🏢 ЖК", callback_data=f"edit_collage_complex_{crm_id}")
+        ],
+        [
+            InlineKeyboardButton("📍 Адрес", callback_data=f"edit_collage_address_{crm_id}"),
+            InlineKeyboardButton("📐 Площадь", callback_data=f"edit_collage_area_{crm_id}")
+        ],
+        [
+            InlineKeyboardButton("🏠 Комнаты", callback_data=f"edit_collage_rooms_{crm_id}"),
+            InlineKeyboardButton("🏗️ Этаж", callback_data=f"edit_collage_floor_{crm_id}")
+        ],
+        [
+            InlineKeyboardButton("💰 Цена", callback_data=f"edit_collage_price_{crm_id}"),
+            InlineKeyboardButton("🏗️ Класс", callback_data=f"edit_collage_class_{crm_id}")
+        ],
+        [
+            InlineKeyboardButton("👤 РОП", callback_data=f"edit_collage_rop_{crm_id}"),
+            InlineKeyboardButton("📞 Телефон", callback_data=f"edit_collage_phone_{crm_id}")
+        ],
+        [
+            InlineKeyboardButton("📋 Достоинства", callback_data=f"edit_collage_benefits_{crm_id}")
+        ],
+        [
+            InlineKeyboardButton("✅ Продолжить с фото", callback_data=f"collage_proceed_{crm_id}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Отмена", callback_data=f"contract_{crm_id}")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(message, reply_markup=reply_markup)
+
+
 def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 

@@ -1,8 +1,10 @@
 import csv
 import logging
+import re
+import asyncio
 from typing import Dict, List, Optional, Tuple
 import httpx
-from config import N8N_WEBHOOK_URL, AGENTS_FILE
+from config import N8N_WEBHOOK_URL, AGENTS_FILE, REQUEST_TIMEOUT, MAX_RETRIES
 from cache import cache_manager
 
 logger = logging.getLogger(__name__)
@@ -13,7 +15,72 @@ class CRMData:
         # Обратная мапа для быстрого поиска телефона по имени
         self.agent_name_to_phone: Dict[str, str] = {name: phone for phone, name in self.agents.items() if name}
         self._client: Optional[httpx.AsyncClient] = None
-        self._request_timeout_seconds: float = 15.0
+        self._request_timeout_seconds: float = REQUEST_TIMEOUT
+    
+    @staticmethod
+    def normalize_phone(phone: str) -> str:
+        """
+        Нормализует номер телефона к единому формату 7XXXXXXXXXX
+        
+        Обрабатывает различные форматы:
+        - 87777777777 -> 7777777777
+        - +77777777777 -> 7777777777  
+        - 7777777777 -> 7777777777
+        - 8777777777 -> 7777777777 (если 10 цифр)
+        """
+        if not phone:
+            return ""
+        
+        # Убираем все символы кроме цифр и +
+        cleaned = re.sub(r'[^\d+]', '', phone.strip())
+        
+        # Убираем + если есть
+        if cleaned.startswith('+'):
+            cleaned = cleaned[1:]
+        
+        # Если номер начинается с 8, заменяем на 7
+        if cleaned.startswith('8'):
+            cleaned = '7' + cleaned[1:]
+        
+        # Если номер начинается с 7 и имеет 11 цифр, оставляем как есть
+        if cleaned.startswith('7') and len(cleaned) == 11:
+            return cleaned
+        
+        # Если номер начинается с 7 и имеет 10 цифр, добавляем 7 в начало
+        if cleaned.startswith('7') and len(cleaned) == 10:
+            return '7' + cleaned
+        
+        # Если номер не начинается с 7, но имеет 10 цифр, добавляем 7
+        if len(cleaned) == 10 and not cleaned.startswith('7'):
+            return '7' + cleaned
+        
+        # Если номер не начинается с 7, но имеет 11 цифр, заменяем первую цифру на 7
+        if len(cleaned) == 11 and not cleaned.startswith('7'):
+            return '7' + cleaned[1:]
+        
+        # Если ничего не подошло, возвращаем как есть
+        return cleaned
+    
+    @staticmethod
+    def is_valid_phone(phone: str) -> bool:
+        """
+        Проверяет, является ли номер телефона валидным казахстанским номером
+        """
+        normalized = CRMData.normalize_phone(phone)
+        
+        # Проверяем, что номер начинается с 7 и имеет 11 цифр
+        if not normalized.startswith('7') or len(normalized) != 11:
+            return False
+        
+        # Проверяем, что все символы - цифры
+        if not normalized.isdigit():
+            return False
+        
+        # Проверяем код страны Казахстана (7)
+        if not normalized.startswith('77'):
+            return False
+        
+        return True
     
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -21,41 +88,73 @@ class CRMData:
         return self._client
     
     def load_agents(self) -> Dict[str, str]:
-        """Загружает список агентов из CSV файла"""
+        """Загружает список агентов из CSV файла с нормализацией номеров телефонов"""
         agents = {}
+        invalid_phones = []
         try:
             with open(AGENTS_FILE, 'r', encoding='utf-8') as file:
                 reader = csv.reader(file)
-                for row in reader:
+                for row_num, row in enumerate(reader, 1):
                     if len(row) >= 2 and row[1].strip():
                         # Убираем лишние пробелы из имени
                         name = ' '.join(row[0].strip().split())
-                        phone = row[1].strip()
-                        agents[phone] = name
+                        raw_phone = row[1].strip()
+                        
+                        # Нормализуем номер телефона
+                        normalized_phone = self.normalize_phone(raw_phone)
+                        
+                        # Проверяем валидность номера
+                        if self.is_valid_phone(normalized_phone):
+                            agents[normalized_phone] = name
+                        else:
+                            invalid_phones.append(f"Строка {row_num}: {name} - {raw_phone}")
+                            logger.warning(f"Невалидный номер телефона в строке {row_num}: {raw_phone} для агента {name}")
+        
         except FileNotFoundError:
             logger.error(f"Файл {AGENTS_FILE} не найден")
+        
+        if invalid_phones:
+            logger.warning(f"Найдено {len(invalid_phones)} невалидных номеров телефонов:")
+            for invalid in invalid_phones:
+                logger.warning(f"  {invalid}")
+        
+        logger.info(f"Загружено {len(agents)} агентов с валидными номерами телефонов")
         return agents
     
     def get_agent_by_phone(self, phone: str) -> Optional[str]:
-        """Возвращает имя агента по номеру телефона"""
-        return self.agents.get(phone)
+        """Возвращает имя агента по номеру телефона с нормализацией"""
+        if not phone:
+            return None
+        
+        # Нормализуем введенный номер
+        normalized_phone = self.normalize_phone(phone)
+        
+        # Ищем агента по нормализованному номеру
+        return self.agents.get(normalized_phone)
 
     def get_phone_by_agent(self, agent_name: str) -> Optional[str]:
-        """Возвращает номер телефона по имени агента"""
-        return self.agent_name_to_phone.get(agent_name)
+        """Возвращает нормализованный номер телефона по имени агента"""
+        phone = self.agent_name_to_phone.get(agent_name)
+        if phone:
+            return self.normalize_phone(phone)
+        return phone
     
     async def get_all_contracts(self) -> List[Dict]:
-        """Получает все контракты из n8n (async)"""
-        try:
-            client = await self._get_client()
-            response = await client.get(N8N_WEBHOOK_URL)
-            if response.status_code == 200:
-                return response.json()
-            logger.error(f"Ошибка получения контрактов: {response.status_code}")
-            return []
-        except Exception as e:
-            logger.error(f"Ошибка при запросе к n8n: {e}")
-            return []
+        """Получает все контракты из n8n (async) с retry логикой"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                client = await self._get_client()
+                response = await client.get(N8N_WEBHOOK_URL)
+                if response.status_code == 200:
+                    return response.json()
+                logger.warning(f"Попытка {attempt + 1}/{MAX_RETRIES}: Ошибка получения контрактов: {response.status_code}")
+            except Exception as e:
+                logger.warning(f"Попытка {attempt + 1}/{MAX_RETRIES}: Ошибка при запросе к n8n: {e}")
+                if attempt == MAX_RETRIES - 1:
+                    logger.error(f"Все {MAX_RETRIES} попытки исчерпаны")
+                    return []
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        return []
     
     async def get_contracts_by_agent(self, agent_name: str) -> List[Dict]:
         """Получает контракты конкретного агента"""
@@ -138,20 +237,20 @@ class CRMData:
             
             # Подготавливаем данные для обновления
             update_data = {
-                "signingDate": current_contract.get('Дата подписания', ''),
-                "contractNumber": current_contract.get('Номер договора', ''),
-                "mop": current_contract.get('МОП', ''),
-                "rop": current_contract.get('РОП', ''),
+                # "signingDate": current_contract.get('Дата подписания', ''),
+                # "contractNumber": current_contract.get('Номер договора', ''),
+                # "mop": current_contract.get('МОП', ''),
+                # "rop": current_contract.get('РОП', ''),
                 "crmId": str(crm_id),
-                "clientNameAndPhone": current_contract.get('Имя клиента и номер', ''),
-                "address": current_contract.get('Адрес', ''),
-                "contractPrice": current_contract.get('Цена указанная в договоре', ''),
-                "expires": current_contract.get('Истекает', ''),
+                # "clientNameAndPhone": current_contract.get('Имя клиента и номер', ''),
+                # "address": current_contract.get('Адрес', ''),
+                # "contractPrice": current_contract.get('Цена указанная в договоре', ''),
+                # "expires": current_contract.get('Истекает', ''),
                 "collage": current_contract.get('Коллаж', False),
-                "photoSession": current_contract.get('Фотосессия', False),
-                "photo": current_contract.get('Фото', False),
-                "video": current_contract.get('Видео', False),
-                "link": current_contract.get('Ссылка', ''),
+                # "photoSession": current_contract.get('Фотосессия', False),
+                # "photo": current_contract.get('Фото', False),
+                # "video": current_contract.get('Видео', False),
+                # "link": current_contract.get('Ссылка', ''),
                 "updatedCollage": current_contract.get('Обновленный колаж', False),
                 "krishaUpload": current_contract.get('Загрузка на крышу', ''),
                 "instagram": current_contract.get('Инстаграм', ''),

@@ -7,8 +7,24 @@ services:
     command: ["python", "main.py"]
     restart: unless-stopped
     ports:
-      - "8080:8080" # for webhook mode
+      - "8080:8080"  # Webhook port
+      - "8081:8081"  # Health check port
     volumes:
       - ./data/cache.json:/app/data/cache.json
       - ./data/agents.csv:/app/data/agents.csv:ro
+      - ./logs:/app/logs
+    environment:
+      - TZ=UTC
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
 

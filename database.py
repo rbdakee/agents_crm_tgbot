@@ -108,15 +108,12 @@ class CRMData:
                             agents[normalized_phone] = name
                         else:
                             invalid_phones.append(f"Строка {row_num}: {name} - {raw_phone}")
-                            logger.warning(f"Невалидный номер телефона в строке {row_num}: {raw_phone} для агента {name}")
         
         except FileNotFoundError:
             logger.error(f"Файл {AGENTS_FILE} не найден")
         
         if invalid_phones:
-            logger.warning(f"Найдено {len(invalid_phones)} невалидных номеров телефонов:")
-            for invalid in invalid_phones:
-                logger.warning(f"  {invalid}")
+            logger.warning(f"Найдено {len(invalid_phones)} невалидных номеров телефонов")
         
         logger.info(f"Загружено {len(agents)} агентов с валидными номерами телефонов")
         return agents

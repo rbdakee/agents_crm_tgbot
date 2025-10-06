@@ -41,13 +41,11 @@ class CacheManager:
         if agent_name in cache:
             data = cache[agent_name]
             if self._is_cache_valid(data['timestamp']):
-                logger.info(f"Используем кеш для агента {agent_name}")
                 return data['contracts']
             else:
                 # Удаляем устаревший кеш
                 del cache[agent_name]
                 self._save_cache(cache)
-                logger.info(f"Кеш для агента {agent_name} устарел, удален")
         
         return None
     
@@ -66,7 +64,6 @@ class CacheManager:
             'timestamp': time.time()
         }
         self._save_cache(cache)
-        logger.info(f"Кеш обновлен для агента {agent_name}")
     
     def get_contract_by_crm_id(self, crm_id: str, agent_name: str) -> Optional[Dict]:
         """Получает контракт по CRM ID из кеша"""
@@ -130,7 +127,6 @@ class CacheManager:
         data['by_crm_id'] = by_crm_id
         cache[agent_name] = data
         self._save_cache(cache)
-        logger.info(f"Кеш обновлен для контракта {crm_id}")
     
     def clear_expired_cache(self):
         """Очищает устаревший кеш"""
@@ -144,7 +140,6 @@ class CacheManager:
         
         for agent_name in expired_agents:
             del cache[agent_name]
-            logger.info(f"Удален устаревший кеш для агента {agent_name}")
         
         if expired_agents:
             self._save_cache(cache)

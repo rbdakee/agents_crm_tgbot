@@ -322,12 +322,10 @@ def _build_html(ci: CollageInput) -> str:
     photos_tags = ''.join([f'<img src="{_to_file_url(p)}"/>' for p in photos_srcs])
 
     check_icon = _asset_url('checkmark_icon.png')
-    logger.info(f"Building HTML with {len(ci.benefits)} benefits: {ci.benefits}")
     benefits_items = ''.join([
         f'<li><img class="chk" src="{check_icon}" alt="check"/> {html_escape.escape(b)}</li>'
         for b in ci.benefits
     ])
-    logger.info(f"Generated benefits_items: {benefits_items[:200]}...")
 
     tpl = Template(COLLAGE_TEMPLATE)
     return tpl.safe_substitute(
@@ -354,6 +352,9 @@ def _build_html(ci: CollageInput) -> str:
 
 
 async def render_collage_to_image(ci: CollageInput) -> str:
+    import logging
+    logger = logging.getLogger(__name__)
+    
     html_content = _build_html(ci)
     out_dir = os.path.join('data')
     os.makedirs(out_dir, exist_ok=True)
@@ -361,18 +362,40 @@ async def render_collage_to_image(ci: CollageInput) -> str:
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
-    browser = await launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'])
+    
+    browser = None
     try:
+        browser = await launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+            timeout=30000,
+            handleSIGINT=False,
+            handleSIGTERM=False,
+            handleSIGHUP=False
+        )
+        
         page = await browser.newPage()
         await page.setViewport({'width': 1080, 'height': 1920})
-        # Не поднимаем таймауты: ошибки остаются в логах, а снаружи — общий контроль в хендлере
-        await page.goto('file:///' + os.path.abspath(html_path).replace('\\', '/'))
+        
+        html_url = 'file:///' + os.path.abspath(html_path).replace('\\', '/')
+        await page.goto(html_url, waitUntil='networkidle0', timeout=30000)
+        
         image_path = os.path.join(out_dir, f"collage_{ci.crm_id}.png")
+        
         sheet = await page.querySelector('.sheet')
         if sheet:
-            await sheet.screenshot({'path': image_path})
+            await sheet.screenshot({'path': image_path, 'type': 'png'})
         else:
-            await page.screenshot({'path': image_path})
+            await page.screenshot({'path': image_path, 'type': 'png'})
+        
         return image_path
+        
+    except Exception as e:
+        logger.error(f"Error rendering collage {ci.crm_id}: {e}")
+        raise
     finally:
-        await browser.close()
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass

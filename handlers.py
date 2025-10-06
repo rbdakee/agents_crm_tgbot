@@ -236,7 +236,11 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def my_contracts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
+        # Продолжаем выполнение даже если не удалось ответить на callback
 
     user_id = update.effective_user.id
     agent_name = context.user_data.get('agent_name')
@@ -351,7 +355,11 @@ async def show_search_results_page(message_or_query, contracts: List[Dict], page
 
 async def show_contract_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
+        # Продолжаем выполнение даже если не удалось ответить на callback
 
     agent_name = context.user_data.get('agent_name')
     if not agent_name:
@@ -962,13 +970,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_links_view(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
     # Отдельный просмотр ссылок больше не используется
-    await update.callback_query.answer()
+    try:
+        await update.callback_query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
     await update.callback_query.edit_message_text("Просмотр ссылок перенесен в детали контракта")
 
 
 async def show_add_link_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
+        # Продолжаем выполнение даже если не удалось ответить на callback
 
     agent_name = context.user_data.get('agent_name')
     contract = None

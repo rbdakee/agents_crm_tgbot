@@ -100,7 +100,6 @@ def start_health_server(host='0.0.0.0', port=None):
         
     try:
         server = HTTPServer((host, port), HealthCheckHandler)
-        logger.info(f"Health check сервер запущен на {host}:{port}")
         
         def run_server():
             server.serve_forever()

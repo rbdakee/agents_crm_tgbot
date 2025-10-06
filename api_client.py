@@ -64,26 +64,50 @@ class APIClient:
     def _parse_application_data(self, json_data: Dict) -> ApplicationData:
         """Парсит JSON данные в структуру ApplicationData"""
         
+        # Проверяем структуру данных
+        if not json_data or 'data' not in json_data:
+            raise ValueError("Invalid JSON structure: missing 'data' field")
+        
+        data = json_data['data']
+        if not data:
+            raise ValueError("Invalid JSON structure: 'data' field is empty")
+        
         # Основные данные
-        crm_id = str(json_data['data']['id'])
-        price = json_data['data']['sellDataDto']['objectPrice']
+        crm_id = str(data.get('id', ''))
+        if not crm_id:
+            raise ValueError("Missing CRM ID in data")
+        
+        sell_data = data.get('sellDataDto')
+        if not sell_data:
+            raise ValueError("Missing sellDataDto in data")
+        
+        price = sell_data.get('objectPrice', 0)
         
         # Данные недвижимости
-        real_property = json_data['data']['realPropertyDto']
-        complex_data = real_property['residentialComplexDto']
-        address_data = real_property['addressDto']
+        real_property = data.get('realPropertyDto')
+        if not real_property:
+            raise ValueError("Missing realPropertyDto in data")
         
-        complex_name = complex_data['houseName']
-        address = f"{address_data['street']['nameRu']} дом {address_data['building']}, кв {real_property['apartmentNumber']}"
-        area_sqm = real_property['totalArea']
-        floor = real_property['floor']
-        rooms = real_property['numberOfRooms']
-        housing_class = complex_data['housingClass'] or 'Комфорт'
+        complex_data = real_property.get('residentialComplexDto', {})
+        address_data = real_property.get('addressDto', {})
+        
+        complex_name = complex_data.get('houseName', 'Неизвестный ЖК')
+        
+        # Формируем адрес с проверками
+        street_name = address_data.get('street', {}).get('nameRu', 'Неизвестная улица')
+        building = address_data.get('building', '')
+        apartment = real_property.get('apartmentNumber', '')
+        address = f"{street_name} дом {building}, кв {apartment}" if building and apartment else street_name
+        
+        area_sqm = real_property.get('totalArea', 0)
+        floor = real_property.get('floor', 0)
+        rooms = real_property.get('numberOfRooms', 0)
+        housing_class = complex_data.get('housingClass') or 'Комфорт'
         
         # Агент
-        agent = json_data['data']['agentDto']
-        agent_name = agent['name']
-        agent_surname = agent['surname']
+        agent = data.get('agentDto', {})
+        agent_name = agent.get('name', '')
+        agent_surname = agent.get('surname', '')
         agent_phone = self.format_phone(agent.get('phone', ''))
         
         # Клиент (пока пустой, нужно будет получать отдельно)
@@ -93,7 +117,7 @@ class APIClient:
         benefits = self._extract_benefits(complex_data, real_property)
         
         # Фотографии
-        photo_ids = real_property['photoIdList']
+        photo_ids = real_property.get('photoIdList', [])
         
         return ApplicationData(
             crm_id=crm_id,

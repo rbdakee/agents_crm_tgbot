@@ -309,7 +309,7 @@ def _to_file_url(path: str) -> str:
 
 
 def _asset_url(filename: str) -> str:
-    path = os.path.join('data', 'html_source', filename)
+    path = os.path.join('html_source', filename)
     return 'file:///' + os.path.abspath(path).replace('\\', '/')
 
 

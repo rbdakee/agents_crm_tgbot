@@ -109,13 +109,26 @@ async def main():
 
         if USE_WEBHOOK and WEBHOOK_URL:
             logging.info(f"Бот запущен в режиме вебхука на {WEBAPP_HOST}:{WEBAPP_PORT}")
-            application.run_webhook(
+            # Единый async-путь запуска (без blocking run_webhook). Используем updater.start_webhook
+            await application.initialize()
+            await application.updater.start_webhook(
                 listen=WEBAPP_HOST,
                 port=WEBAPP_PORT,
-                webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
                 url_path=WEBHOOK_PATH,
+                webhook_url=f"{WEBHOOK_URL}{WEBHOOK_PATH}",
                 secret_token=None,
             )
+            await application.start()
+            # Ждем сигнал остановки
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                logging.info("Получен сигнал остановки")
+            finally:
+                await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
         else:
             logging.info("Бот запущен в режиме polling...")
             # Запускаем polling в отдельной задаче

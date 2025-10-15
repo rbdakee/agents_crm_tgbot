@@ -1,21 +1,21 @@
-python-telegram-bot[webhooks]==20.3
-python-dotenv==1.0.0
-httpx==0.24.1
-pyppeteer==1.0.2
+python-telegram-bot[webhooks]
+python-dotenv
+httpx
+pyppeteer
 
 # Google Sheets API
-google-api-python-client==2.108.0
-google-auth-httplib2==0.1.1
-google-auth-oauthlib==1.1.0
-gspread==5.12.0
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+gspread
 
 # PostgreSQL Database
-sqlalchemy[asyncio]==2.0.23
-asyncpg==0.29.0
-psycopg2-binary==2.9.9
+sqlalchemy[asyncio]
+asyncpg
+psycopg2-binary
 
 # Data processing
 # pandas==2.1.4  # Removed - no longer needed
 
 # Additional utilities
-APScheduler==3.10.4
+APScheduler

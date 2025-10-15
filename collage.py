@@ -309,7 +309,7 @@ def _to_file_url(path: str) -> str:
 
 
 def _asset_url(filename: str) -> str:
-    path = os.path.join('data', 'html_source', filename)
+    path = os.path.join('html_source', filename)
     return 'file:///' + os.path.abspath(path).replace('\\', '/')
 
 
@@ -351,7 +351,7 @@ def _build_html(ci: CollageInput) -> str:
     )
 
 
-async def render_collage_to_image(ci: CollageInput) -> str:
+async def render_collage_to_image(ci: CollageInput) -> tuple[str, str]:
     import logging
     logger = logging.getLogger(__name__)
     
@@ -378,7 +378,9 @@ async def render_collage_to_image(ci: CollageInput) -> str:
         await page.setViewport({'width': 1080, 'height': 1920})
         
         html_url = 'file:///' + os.path.abspath(html_path).replace('\\', '/')
-        await page.goto(html_url, waitUntil='networkidle0', timeout=30000)
+        await page.goto(html_url, waitUntil='networkidle0', timeout=45000)
+        # Небольшая пауза, чтобы шрифты/локальные ресурсы гарантированно прогрузились
+        await asyncio.sleep(0.4)
         
         image_path = os.path.join(out_dir, f"collage_{ci.crm_id}.png")
         
@@ -388,7 +390,7 @@ async def render_collage_to_image(ci: CollageInput) -> str:
         else:
             await page.screenshot({'path': image_path, 'type': 'png'})
         
-        return image_path
+        return image_path, html_path
         
     except Exception as e:
         logger.error(f"Error rendering collage {ci.crm_id}: {e}")

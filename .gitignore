@@ -23,6 +23,7 @@ MANIFEST
 
 # Virtual environments
 .env
+.env.production
 .venv
 env/
 venv/
@@ -64,6 +65,9 @@ data/cache.json
 test_*.py
 *_test.py
 quick_test.py
+
+# Google Sheets API credentials
+credentials.json
 
 # Docker
 .dockerignore

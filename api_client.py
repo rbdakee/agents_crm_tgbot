@@ -4,7 +4,7 @@ import logging
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
-from config import API_BASE_URL, DEVICE_UUID
+from config import API_BASE_URL, DEVICE_UUID, AUTH_TOKEN_URL, AUTH_CLIENT_ID, PROFILE_URL
 from collage import CollageInput
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ class APIClient:
         self.base_url = API_BASE_URL
         self.device_uuid = DEVICE_UUID
         self.client: Optional[httpx.AsyncClient] = None
+        self.auth_token_url = AUTH_TOKEN_URL
+        self.auth_client_id = AUTH_CLIENT_ID
+        self.profile_url = PROFILE_URL
     
     async def __aenter__(self):
         self.client = httpx.AsyncClient(timeout=30.0)
@@ -59,6 +62,71 @@ class APIClient:
                 return None
         except Exception as e:
             logger.error(f"Error fetching application data: {e}")
+            return None
+
+    async def login_and_get_profile(self, username: str, password: str) -> Optional[Dict]:
+        """Получает токен по логину/паролю и затем профиль пользователя.
+
+        Требования:
+        - username: 10-значный номер (без 8/7/+7 в начале)
+        - grant_type=password, client_id=htc
+        - Тело: x-www-form-urlencoded
+        - Далее GET профиль с заголовком Authorization: Bearer <token>
+        """
+        try:
+            # Нормализуем логин (оставляем 10 цифр без префикса страны)
+            digits = ''.join(ch for ch in username if ch.isdigit())
+            if len(digits) == 11 and digits.startswith('7'):
+                digits = digits[1:]
+            elif len(digits) == 11 and digits.startswith('8'):
+                digits = digits[1:]
+            # ожидаем 10 цифр
+            if len(digits) != 10:
+                raise ValueError("username должен быть 10-значным номером телефона")
+
+            # 1) Получаем токен
+            token_resp = await self.client.post(
+                self.auth_token_url,
+                data={
+                    'username': digits,
+                    'password': password,
+                    'grant_type': 'password',
+                    'client_id': self.auth_client_id,
+                },
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            )
+            if token_resp.status_code != 200:
+                logger.error(f"Auth failed: {token_resp.status_code} {token_resp.text}")
+                return None
+            token_json = token_resp.json()
+            access_token = token_json.get('access_token')
+            if not access_token:
+                logger.error("Auth failed: access_token not found")
+                return None
+
+            # 2) Запрашиваем профиль
+            profile_resp = await self.client.get(
+                self.profile_url,
+                headers={'Authorization': f'Bearer {access_token}'}
+            )
+            if profile_resp.status_code != 200:
+                logger.error(f"Profile request failed: {profile_resp.status_code} {profile_resp.text}")
+                return None
+
+            profile = profile_resp.json()
+            # Возвращаем только нужные поля и сам токен на будущее
+            return {
+                'token': access_token,
+                'phone': profile.get('phone'),
+                'name': profile.get('name'),
+                'surname': profile.get('surname'),
+                'userId': profile.get('userId'),
+                'raw': profile,
+            }
+        except Exception as e:
+            logger.error(f"Login/profile error: {e}")
             return None
     
     def _parse_application_data(self, json_data: Dict) -> ApplicationData:

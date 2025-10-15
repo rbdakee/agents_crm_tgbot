@@ -8,7 +8,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import threading
 import time
-from database import crm
 from config import HEALTH_CHECK_PORT
 
 logger = logging.getLogger(__name__)
@@ -29,10 +28,10 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             health_status = {
                 "status": "healthy",
                 "timestamp": time.time(),
-                "version": "1.0.0",
+                "version": "2.0.0",
                 "components": {
                     "database": self.check_database(),
-                    "agents": self.check_agents()
+                    "sync": self.check_sync()
                 }
             }
             
@@ -57,12 +56,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 "status": "ready",
                 "timestamp": time.time(),
                 "checks": {
-                    "database_loaded": len(crm.agents) > 0,
-                    "agents_count": len(crm.agents)
+                    "database_connected": self.check_database(),
+                    "sync_enabled": self.check_sync()
                 }
             }
             
-            if ready_status["checks"]["database_loaded"]:
+            if ready_status["checks"]["database_connected"]:
                 self.send_response(200)
             else:
                 self.send_response(503)
@@ -78,14 +77,18 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def check_database(self):
         """Проверка состояния базы данных"""
         try:
-            return len(crm.agents) > 0
+            # Простая проверка - пытаемся импортировать менеджер БД
+            from database_postgres import db_manager
+            return db_manager is not None
         except Exception:
             return False
     
-    def check_agents(self):
-        """Проверка загруженности агентов"""
+    def check_sync(self):
+        """Проверка состояния синхронизации"""
         try:
-            return len(crm.agents) > 0
+            # Простая проверка - пытаемся импортировать менеджер синхронизации
+            from sheets_sync import sync_manager
+            return sync_manager is not None
         except Exception:
             return False
     

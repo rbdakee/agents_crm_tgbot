@@ -6,7 +6,7 @@ load_dotenv()
 # Конфигурация бота
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
-AGENTS_FILE = 'data/agents.csv'
+# AGENTS_FILE = 'data/agents.csv'  # Removed - no longer using agents.csv
 
 # Проверяем обязательные переменные
 if not BOT_TOKEN:
@@ -47,8 +47,7 @@ if not DATABASE_URL:
 # Учетные данные загружаются из файла credentials.json
 
 # Файлы и пути
-# Единый источник AGENTS_FILE (без дублирования)
-AGENTS_FILE = os.getenv('AGENTS_FILE', AGENTS_FILE)
+# AGENTS_FILE removed - no longer using agents.csv file
 
 # Настройки приложения
 CONTRACTS_PER_PAGE = int(os.getenv('CONTRACTS_PER_PAGE', '10'))

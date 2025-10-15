@@ -10,7 +10,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -212,28 +211,23 @@ class PostgreSQLManager:
             normalized_phone = self.normalize_phone(phone)
             logger.info(f"Поиск агента: введенный номер {phone}, нормализованный {normalized_phone}")
             
-            # Загружаем файл агентов
-            import pandas as pd
-            agents_df = pd.read_csv('data/agents.csv', header=None, names=['name', 'phone'])
-            
-            # Ищем агента по номеру
-            for _, row in agents_df.iterrows():
-                agent_phone_raw = str(row.get('phone', ''))
-                agent_phone = self.normalize_phone(agent_phone_raw)
-                if agent_phone == normalized_phone:
-                    logger.info(f"Найден агент: {row.get('name', '')} с номером {agent_phone_raw}")
-                    return str(row.get('name', ''))
-            
-            # Если не найден, попробуем найти по частичному совпадению
-            logger.info(f"Попытка частичного поиска для номера {normalized_phone}")
-            for _, row in agents_df.iterrows():
-                agent_phone_raw = str(row.get('phone', ''))
-                agent_phone = self.normalize_phone(agent_phone_raw)
-                # Проверяем последние 10 цифр
-                if len(normalized_phone) >= 10 and len(agent_phone) >= 10:
-                    if normalized_phone[-10:] == agent_phone[-10:]:
-                        logger.info(f"Найден агент по частичному совпадению: {row.get('name', '')} с номером {agent_phone_raw}")
-                        return str(row.get('name', ''))
+            # Ищем агента в базе данных по номеру телефона
+            async with self.async_session() as session:
+                # Ищем в полях mop, rop, dd по номеру телефона
+                result = await session.execute(
+                    text("SELECT DISTINCT mop, rop, dd FROM properties WHERE "
+                         "LOWER(mop) LIKE LOWER(:phone) OR "
+                         "LOWER(rop) LIKE LOWER(:phone) OR "
+                         "LOWER(dd) LIKE LOWER(:phone)"),
+                    {"phone": f"%{normalized_phone}%"}
+                )
+                
+                for row in result.fetchall():
+                    # Проверяем каждое поле на совпадение номера
+                    for field in [row.mop, row.rop, row.dd]:
+                        if field and normalized_phone in field:
+                            logger.info(f"Найден агент: {field} с номером {normalized_phone}")
+                            return field
             
             logger.warning(f"Агент с номером {normalized_phone} не найден")
             return None
@@ -245,14 +239,26 @@ class PostgreSQLManager:
     async def get_phone_by_agent(self, agent_name: str) -> Optional[str]:
         """Получает номер телефона агента по имени"""
         try:
-            # Загружаем файл агентов
-            import pandas as pd
-            agents_df = pd.read_csv('data/agents.csv', header=None, names=['name', 'phone'])
-            
-            # Ищем агента по имени
-            for _, row in agents_df.iterrows():
-                if str(row.get('name', '')).strip() == agent_name.strip():
-                    return str(row.get('phone', ''))
+            # Ищем агента в базе данных по имени
+            async with self.async_session() as session:
+                # Ищем в полях mop, rop, dd по имени агента
+                result = await session.execute(
+                    text("SELECT DISTINCT mop, rop, dd FROM properties WHERE "
+                         "LOWER(mop) LIKE LOWER(:agent_name) OR "
+                         "LOWER(rop) LIKE LOWER(:agent_name) OR "
+                         "LOWER(dd) LIKE LOWER(:agent_name)"),
+                    {"agent_name": f"%{agent_name.strip()}%"}
+                )
+                
+                for row in result.fetchall():
+                    # Проверяем каждое поле на совпадение имени
+                    for field in [row.mop, row.rop, row.dd]:
+                        if field and agent_name.strip().lower() in field.lower():
+                            # Извлекаем номер телефона из поля (предполагаем, что номер в конце)
+                            import re
+                            phone_match = re.search(r'\b[78]\d{10}\b', field)
+                            if phone_match:
+                                return phone_match.group()
             
             return None
             

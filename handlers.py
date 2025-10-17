@@ -1824,18 +1824,26 @@ async def update_contract_status(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная синхронизация данных из Google Sheets"""
+    """Ручная синхронизация данных из Google Sheets (только для @rbdakee)"""
     try:
         from sheets_sync import get_sync_manager
         
-        await update.message.reply_text("🔄 Начинаю ручную синхронизацию...")
+        # Проверяем, что команду вызвал авторизованный пользователь @rbdakee
+        authorized_user_id = 893220231  # User ID для @rbdakee
+        
+        if update.effective_user.id != authorized_user_id:
+            await update.message.reply_text("❌ У вас нет прав для выполнения полной синхронизации")
+            logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить полную синхронизацию")
+            return
+        
+        await update.message.reply_text("🔄 Начинаю полную синхронизацию...")
         
         sync_manager = await get_sync_manager()
         sync_stats = await sync_manager.sync_from_sheets()
         # После импорта из Sheets(1) сразу выгружаем в Sheets(2)
         to_sheets_stats = await sync_manager.sync_to_sheets()
         
-        message = f"✅ Синхронизация завершена!\n\n"
+        message = f"✅ Полная синхронизация завершена!\n\n"
         message += f"📥 Sheets(1) → DB:\n"
         message += f"• Создано: {sync_stats.get('created', 0)}\n"
         message += f"• Обновлено: {sync_stats.get('updated', 0)}\n"
@@ -1845,6 +1853,7 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"• Ошибок: {to_sheets_stats.get('errors', 0)}\n"
         
         await update.message.reply_text(message)
+        logger.info(f"Полная синхронизация выполнена пользователем {update.effective_user.username} (ID: {update.effective_user.id})")
     except Exception as e:
         logger.error(f"Ошибка ручной синхронизации: {e}")
         await update.message.reply_text(f"❌ Ошибка синхронизации: {str(e)}")

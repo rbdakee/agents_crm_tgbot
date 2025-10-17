@@ -64,6 +64,172 @@ class APIClient:
             logger.error(f"Error fetching application data: {e}")
             return None
 
+    async def get_crm_data_batch(self, crm_ids: List[str], batch_size: int = 200) -> Dict[str, Dict]:
+        """Получает данные из CRM API батчами с параллельными запросами
+        
+        Args:
+            crm_ids: Список CRM ID для получения данных
+            batch_size: Размер батча (по умолчанию 200)
+            
+        Returns:
+            Словарь {crm_id: {address, complex, price}} с данными из API
+        """
+        result = {}
+        
+        # Разбиваем на батчи
+        total_batches = (len(crm_ids) + batch_size - 1) // batch_size
+        logger.info(f"Получение данных из CRM API: {len(crm_ids)} записей, {total_batches} батчей по {batch_size}")
+        
+        for batch_index in range(total_batches):
+            start_idx = batch_index * batch_size
+            end_idx = min(start_idx + batch_size, len(crm_ids))
+            batch_crm_ids = crm_ids[start_idx:end_idx]
+            
+            logger.info(f"Обрабатываю батч {batch_index + 1}/{total_batches} ({len(batch_crm_ids)} записей)")
+            
+            # Создаем задачи для параллельных запросов
+            tasks = []
+            for crm_id in batch_crm_ids:
+                task = self._fetch_single_crm_data(crm_id)
+                tasks.append(task)
+            
+            # Выполняем все запросы параллельно
+            try:
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Обрабатываем результаты
+                for i, result_data in enumerate(batch_results):
+                    crm_id = batch_crm_ids[i]
+                    if isinstance(result_data, Exception):
+                        logger.error(f"Ошибка получения данных для {crm_id}: {result_data}")
+                        result[crm_id] = {"address": "", "complex": "", "price": None}
+                    elif result_data:
+                        result[crm_id] = result_data
+                    else:
+                        result[crm_id] = {"address": "", "complex": "", "price": None}
+                
+                logger.info(f"Батч {batch_index + 1} завершен: {len(batch_results)} записей")
+                
+                # Небольшая пауза между батчами, чтобы не перегружать API
+                if batch_index < total_batches - 1:
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Ошибка при обработке батча {batch_index + 1}: {e}")
+                # Заполняем пустыми данными для этого батча
+                for crm_id in batch_crm_ids:
+                    result[crm_id] = {"address": "", "complex": "", "price": None}
+        
+        logger.info(f"Получение данных из CRM API завершено: {len(result)} записей")
+        return result
+
+    async def _fetch_single_crm_data(self, crm_id: str) -> Optional[Dict]:
+        """Получает данные для одного CRM ID и возвращает только нужные поля"""
+        url = f"{self.base_url}/applications-client/{crm_id}/{self.device_uuid}/"
+        
+        try:
+            response = await self.client.get(url)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    return self._extract_crm_fields(data)
+                except Exception as json_error:
+                    logger.warning(f"Ошибка парсинга JSON для {crm_id}: {json_error}")
+                    return {"address": "", "complex": "", "price": None}
+            elif response.status_code == 404:
+                logger.debug(f"CRM ID {crm_id} не найден (404)")
+                return {"address": "", "complex": "", "price": None}
+            else:
+                logger.warning(f"API request failed for {crm_id} with status {response.status_code}")
+                return {"address": "", "complex": "", "price": None}
+        except Exception as e:
+            logger.warning(f"Error fetching data for {crm_id}: {e}")
+            return {"address": "", "complex": "", "price": None}
+
+    def _extract_crm_fields(self, json_data: Dict) -> Dict:
+        """Извлекает только нужные поля (address, complex, price) из JSON ответа API"""
+        try:
+            # Проверяем базовую структуру
+            if not json_data:
+                logger.debug("API ответ пустой")
+                return {"address": "", "complex": "", "price": None}
+            
+            # Проверяем наличие поля success
+            if not json_data.get('success', False):
+                logger.debug(f"API вернул success=False: {json_data}")
+                return {"address": "", "complex": "", "price": None}
+            
+            # Проверяем наличие поля data
+            if 'data' not in json_data:
+                logger.debug(f"API ответ не содержит поле 'data': {json_data}")
+                return {"address": "", "complex": "", "price": None}
+            
+            data = json_data['data']
+            if not data:
+                logger.debug("Поле 'data' пустое")
+                return {"address": "", "complex": "", "price": None}
+            
+            # Цена из sellDataDto
+            sell_data = data.get('sellDataDto')
+            price = None
+            if sell_data and isinstance(sell_data, dict):
+                price = sell_data.get('objectPrice')
+            
+            # Данные недвижимости
+            real_property = data.get('realPropertyDto')
+            complex_name = ""
+            address = ""
+            
+            if real_property and isinstance(real_property, dict):
+                complex_data = real_property.get('residentialComplexDto')
+                address_data = real_property.get('addressDto')
+                
+                # Название ЖК
+                if complex_data and isinstance(complex_data, dict):
+                    complex_name = complex_data.get('houseName', '')
+                
+                # Формируем адрес
+                if address_data and isinstance(address_data, dict):
+                    address_parts = []
+                    
+                    city = address_data.get('city')
+                    if city and isinstance(city, dict):
+                        city_name = city.get('nameRu')
+                        if city_name:
+                            address_parts.append(city_name)
+                    
+                    district = address_data.get('district')
+                    if district and isinstance(district, dict):
+                        district_name = district.get('nameRu')
+                        if district_name:
+                            address_parts.append(district_name)
+                    
+                    street = address_data.get('street')
+                    if street and isinstance(street, dict):
+                        street_name = street.get('nameRu')
+                        if street_name:
+                            building = address_data.get('building', '')
+                            if building:
+                                street_name += f" {building}"
+                            address_parts.append(street_name)
+                    
+                    apartment = real_property.get('apartmentNumber')
+                    if apartment:
+                        address_parts.append(f"кв {apartment}")
+                    
+                    address = ", ".join(address_parts)
+            
+            return {
+                "address": address,
+                "complex": complex_name,
+                "price": price
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка извлечения полей из API ответа: {e}")
+            logger.debug(f"Проблемный JSON: {json_data}")
+            return {"address": "", "complex": "", "price": None}
+
     async def login_and_get_profile(self, username: str, password: str) -> Optional[Dict]:
         """Получает токен по логину/паролю и затем профиль пользователя.
 

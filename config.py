@@ -6,7 +6,6 @@ load_dotenv()
 # Конфигурация бота
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 BOT_USERNAME = os.getenv('BOT_USERNAME')
-# AGENTS_FILE = 'data/agents.csv'  # Removed - no longer using agents.csv
 
 # Проверяем обязательные переменные
 if not BOT_TOKEN:
@@ -38,16 +37,10 @@ if not DATABASE_URL:
     DB_NAME = os.getenv('DB_NAME', 'agents_crm')
     DB_USER = os.getenv('DB_USER', 'postgres')
     DB_PASSWORD = os.getenv('DB_PASSWORD', '')
-    # Используем SQLite для быстрого тестирования
-    # DATABASE_URL = "sqlite+aiosqlite:///./agents_crm.db"
-    # Для PostgreSQL раскомментируйте строку ниже:
     DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # Google Sheets Credentials
 # Учетные данные загружаются из файла credentials.json
-
-# Файлы и пути
-# AGENTS_FILE removed - no longer using agents.csv file
 
 # Настройки приложения
 CONTRACTS_PER_PAGE = int(os.getenv('CONTRACTS_PER_PAGE', '10'))
@@ -63,8 +56,7 @@ WEBHOOK_PATH = os.getenv('WEBHOOK_PATH', f"/{BOT_TOKEN}")
 # Health check
 HEALTH_CHECK_PORT = int(os.getenv('HEALTH_CHECK_PORT', '8081'))
 
-# Таймауты и лимиты (не используются напрямую) — можно вернуть при необходимости
-
 # Настройки синхронизации
 SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '5'))  # Интервал синхронизации в минутах
 SYNC_ENABLED = os.getenv('SYNC_ENABLED', 'true').lower() == 'true'  # Включить/выключить синхронизацию
+CRM_API_ENRICHMENT = os.getenv('CRM_API_ENRICHMENT', 'true').lower() == 'true'  # Включить/выключить обогащение данными из CRM API

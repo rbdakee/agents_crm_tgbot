@@ -7,7 +7,6 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, date, time as dtime
-from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Any
 import gspread
 from google.oauth2.service_account import Credentials
@@ -16,6 +15,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 import json
+from api_client import APIClient
+from config import CRM_API_ENRICHMENT
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,6 @@ EXPECTED_DEALS_HEADERS: List[str] = [
     'РОП',
     'ДД',
     'Имя клиента и номер',
-    'Адрес',
-    'ЖК',
-    'Цена указанная в договоре',
-    'Истекает',
 ]
 
 # Размер батча для коммитов при полной синхронизации
@@ -59,9 +56,6 @@ class SheetsSyncManager:
         # Состояние синхронизации
         self.last_sync_time = None
         self.sync_in_progress = False
-        # Расписание: полная синхронизация ежедневно в 02:00 по Алматы (GMT+5)
-        self.timezone = ZoneInfo("Asia/Almaty")
-        self.last_full_sync_date: Optional[date] = None
         
     def _init_google_sheets(self):
         """Инициализация подключения к Google Sheets"""
@@ -169,6 +163,12 @@ class SheetsSyncManager:
             deals_crm_ids = {row['crm_id'] for row in deals_data}
             
             
+            # Обогащаем данные из CRM API (если включено)
+            if CRM_API_ENRICHMENT:
+                await self._enrich_with_crm_data(deals_data)
+            else:
+                logger.info("Обогащение данными из CRM API отключено")
+            
             # Синхронизируем с базой данных: upsert сделок и удаление отсутствующих
             logger.info(f"Начинаем запись {len(deals_data)} записей в базу данных...")
             async with self.async_session() as session:
@@ -230,6 +230,7 @@ class SheetsSyncManager:
         """Быстрая синхронизация: только создание новых и удаление отсутствующих записей.
 
         Важно: существующие записи НЕ обновляются вообще. Проверяем только наличие CRM ID.
+        Для новых записей получаем данные из CRM API.
         """
         if self.sync_in_progress:
             logger.warning("Синхронизация уже выполняется, пропускаем")
@@ -258,6 +259,11 @@ class SheetsSyncManager:
                 # Лишние к удалению
                 to_delete = list(db_ids - deals_crm_ids)
 
+                # Получаем данные из CRM API только для новых записей
+                new_crm_data = {}
+                if new_ids and CRM_API_ENRICHMENT:
+                    new_crm_data = await self._enrich_new_records_with_crm_data(new_ids)
+
                 # Вставляем новые записи батчево
                 if new_ids:
                     logger.info(f"Новых записей для вставки: {len(new_ids)}")
@@ -268,6 +274,17 @@ class SheetsSyncManager:
                             continue
                         try:
                             property_data = deal.copy()
+                            
+                            # Обогащаем данными из CRM API если доступны
+                            if crm_id in new_crm_data:
+                                api_data = new_crm_data[crm_id]
+                                if api_data.get('address'):
+                                    property_data['address'] = api_data['address']
+                                if api_data.get('complex'):
+                                    property_data['complex'] = api_data['complex']
+                                if api_data.get('price') is not None:
+                                    property_data['contract_price'] = api_data['price']
+                            
                             property_data['created_at'] = now
                             property_data['last_modified_at'] = now
                             property_data['last_modified_by'] = 'SHEET'
@@ -316,22 +333,22 @@ class SheetsSyncManager:
         return stats
     
     async def _load_deals_sheet(self) -> List[Dict]:
-        """Загружает данные из таблицы SHEET_DEALS (только для чтения)"""
+        """Загружает данные из таблицы SHEET_DEALS (только поля из Sheets)"""
         try:
-            # Всегда читаем значения напрямую и берём только столбцы A..K (11 столбцов)
+            # Читаем значения напрямую и берём только столбцы A..G (7 столбцов)
             values = self.deals_sheet.get_all_values()
             if not values:
                 raise RuntimeError("Лист пуст или недоступен")
-            # Первая строка — заголовки, игнорируем их содержимое и жёстко маппим A..K на EXPECTED_DEALS_HEADERS
+            # Первая строка — заголовки, игнорируем их содержимое и жёстко маппим A..G на EXPECTED_DEALS_HEADERS
             rows = values[1:]
             records = []
             for row in rows:
-                # берём первые 11 ячеек (A..K)
-                cols = (row[:11] if len(row) >= 11 else row + [''] * (11 - len(row)))
+                # берём первые 7 ячеек (A..G)
+                cols = (row[:7] if len(row) >= 7 else row + [''] * (7 - len(row)))
                 # пропускаем полностью пустые строки
                 if not any((c.strip() for c in cols)):
                     continue
-                rec = {EXPECTED_DEALS_HEADERS[i]: cols[i].strip() for i in range(11)}
+                rec = {EXPECTED_DEALS_HEADERS[i]: cols[i].strip() for i in range(7)}
                 records.append(rec)
             
             # Преобразуем в нужный формат
@@ -342,19 +359,21 @@ class SheetsSyncManager:
             for record in records:
                 crm_val = str(record.get('CRM ID', '')).strip()
                 if crm_val:  # Пропускаем пустые строки и пробелы
+                    date_signed = self._parse_date(record.get('Дата подписания'))
+                    expires_date = self._calculate_expires_date(date_signed)
+                    
                     deals_data.append({
                         'crm_id': crm_val,
-                        'date_signed': self._parse_date(record.get('Дата подписания')),
+                        'date_signed': date_signed,
                         'contract_number': _to_str(record.get('Номер договора', '')),
                         'mop': _to_str(record.get('МОП', '')),
                         'rop': _to_str(record.get('РОП', '')),
                         'dd': _to_str(record.get('ДД', '')),
                         'client_name': _to_str(record.get('Имя клиента и номер', '')),
-                        'address': _to_str(record.get('Адрес', '')),
-                        'complex': _to_str(record.get('ЖК', '')),
-                        # цену парсим как число
-                        'contract_price': self._parse_price(record.get('Цена указанная в договоре')),
-                        'expires': self._parse_date(record.get('Истекает'))
+                        'address': '',  # Будет заполнено из CRM API
+                        'complex': '',  # Будет заполнено из CRM API
+                        'contract_price': None,  # Будет заполнено из CRM API
+                        'expires': expires_date  # Вычисляется автоматически
                     })
             
             logger.info(f"Загружено {len(deals_data)} записей из SHEET_DEALS")
@@ -363,6 +382,72 @@ class SheetsSyncManager:
         except Exception as e:
             logger.error(f"Ошибка загрузки SHEET_DEALS: {e}")
             return []
+
+    async def _enrich_with_crm_data(self, deals_data: List[Dict]):
+        """Обогащает данные из Google Sheets данными из CRM API для полей address, complex, contract_price"""
+        if not deals_data:
+            return
+        
+        # Собираем все CRM ID
+        crm_ids = [deal['crm_id'] for deal in deals_data if deal.get('crm_id')]
+        if not crm_ids:
+            logger.warning("Нет CRM ID для обогащения данными из API")
+            return
+        
+        logger.info(f"Обогащение {len(crm_ids)} записей данными из CRM API")
+        
+        try:
+            # Получаем данные из CRM API батчами
+            async with APIClient() as api_client:
+                crm_data = await api_client.get_crm_data_batch(crm_ids, batch_size=200)
+                
+                # Обновляем данные
+                updated_count = 0
+                for deal in deals_data:
+                    crm_id = deal.get('crm_id')
+                    if crm_id and crm_id in crm_data:
+                        api_data = crm_data[crm_id]
+                        
+                        # Заменяем данные из Sheets на данные из API
+                        updated = False
+                        if api_data.get('address'):
+                            deal['address'] = api_data['address']
+                            updated = True
+                        if api_data.get('complex'):
+                            deal['complex'] = api_data['complex']
+                            updated = True
+                        if api_data.get('price') is not None:
+                            deal['contract_price'] = api_data['price']
+                            updated = True
+                        
+                        if updated:
+                            updated_count += 1
+                            logger.debug(f"Обновлены данные для CRM ID {crm_id}: address={deal['address'][:50]}..., complex={deal['complex']}, price={deal['contract_price']}")
+                    else:
+                        logger.debug(f"Не удалось получить данные из API для CRM ID {crm_id}")
+                
+                logger.info(f"Обогащение завершено: {updated_count} из {len(deals_data)} записей обновлено данными из CRM API")
+                
+        except Exception as e:
+            logger.error(f"Ошибка обогащения данными из CRM API: {e}")
+            # Продолжаем работу с исходными данными из Sheets
+
+    async def _enrich_new_records_with_crm_data(self, new_crm_ids: List[str]) -> Dict[str, Dict]:
+        """Получает данные из CRM API только для новых CRM ID"""
+        if not new_crm_ids:
+            return {}
+        
+        logger.info(f"Получение данных из CRM API для {len(new_crm_ids)} новых записей")
+        
+        try:
+            async with APIClient() as api_client:
+                crm_data = await api_client.get_crm_data_batch(new_crm_ids, batch_size=200)
+                logger.info(f"Получены данные из CRM API для {len(crm_data)} новых записей")
+                return crm_data
+                
+        except Exception as e:
+            logger.error(f"Ошибка получения данных из CRM API для новых записей: {e}")
+            return {}
     
     async def _load_progress_sheet(self) -> List[Dict]:
         """Загружает данные из таблицы SHEET_PROGRESS (можно изменять)"""
@@ -448,7 +533,7 @@ class SheetsSyncManager:
             exists = result.fetchone() is not None
             
             if exists:
-                # Обновляем существующую запись: только поля из deals (read-only)
+                # Обновляем существующую запись: поля из deals (read-only) + поля из CRM API
                 deals_readonly_fields = {
                     'date_signed','contract_number','mop','rop','dd',
                     'client_name','address','complex','contract_price','expires'
@@ -640,29 +725,52 @@ class SheetsSyncManager:
             try:
                 await asyncio.sleep(interval_sec)
                 logger.info("Выполняется фоновая синхронизация")
-                # Проверяем расписание: каждый день в 02:00 по Asia/Almaty
-                now_tz = datetime.now(self.timezone)
-                today = now_tz.date()
-                run_time_today = datetime.combine(today, dtime(hour=2, minute=0, second=0, tzinfo=self.timezone))
-
-                if (self.last_full_sync_date != today) and (now_tz >= run_time_today):
-                    full_stats = await self.sync_from_sheets()
-                    self.last_full_sync_date = today
-                    logger.info(f"Полная синхронизация Sheets(1)->DB: {full_stats}")
-                    # После полной — выгружаем DB -> Sheets(2)
-                    to_sheets_stats = await self.sync_to_sheets()
-                    logger.info(f"Синхронизация DB->Sheets(2): {to_sheets_stats}")
-                else:
-                    fast_stats = await self.sync_from_sheets_fast()
-                    logger.info(f"Быстрая синхронизация Sheets(1)->DB: {fast_stats}")
-                    # После быстрой — тоже выгружаем DB -> Sheets(2)
-                    to_sheets_stats = await self.sync_to_sheets()
-                    logger.info(f"Синхронизация DB->Sheets(2): {to_sheets_stats}")
+                # Выполняем только быструю синхронизацию
+                # Полная синхронизация теперь доступна только через команду /sync для авторизованного пользователя
+                fast_stats = await self.sync_from_sheets_fast()
+                logger.info(f"Быстрая синхронизация Sheets(1)->DB: {fast_stats}")
+                # После быстрой — выгружаем DB -> Sheets(2)
+                to_sheets_stats = await self.sync_to_sheets()
+                logger.info(f"Синхронизация DB->Sheets(2): {to_sheets_stats}")
             except Exception as e:
                 logger.error(f"Ошибка фоновой синхронизации: {e}")
                 await asyncio.sleep(60)  # Пауза при ошибке
     
     # Вспомогательные методы для парсинга данных
+    
+    def _calculate_expires_date(self, date_signed: Optional[datetime]) -> Optional[datetime]:
+        """Вычисляет дату истечения: дата подписания + 2 месяца"""
+        if not date_signed:
+            return None
+        
+        try:
+            # Добавляем 2 месяца к дате подписания
+            if date_signed.month <= 10:
+                # Если месяц <= 10, просто добавляем 2
+                expires_month = date_signed.month + 2
+                expires_year = date_signed.year
+            else:
+                # Если месяц 11 или 12, переходим на следующий год
+                expires_month = date_signed.month + 2 - 12
+                expires_year = date_signed.year + 1
+            
+            # Создаем новую дату
+            expires_date = date_signed.replace(year=expires_year, month=expires_month)
+            
+            # Проверяем, что день существует в новом месяце
+            # Если нет (например, 31 января -> 31 марта, но в марте только 31 день),
+            # то берем последний день месяца
+            try:
+                return expires_date
+            except ValueError:
+                # Если день не существует в новом месяце, берем последний день месяца
+                from calendar import monthrange
+                last_day = monthrange(expires_year, expires_month)[1]
+                return expires_date.replace(day=last_day)
+                
+        except Exception as e:
+            logger.error(f"Ошибка вычисления даты истечения для {date_signed}: {e}")
+            return None
     
     def _parse_date(self, date_str: str) -> Optional[datetime]:
         """Парсит дату из строки"""

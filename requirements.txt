@@ -1,7 +1,7 @@
 python-telegram-bot[webhooks]
 python-dotenv
 httpx
-pyppeteer
+pyppeteer==1.0.2
 
 # Google Sheets API
 google-api-python-client

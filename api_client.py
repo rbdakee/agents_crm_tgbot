@@ -58,7 +58,7 @@ class APIClient:
                 data = response.json()
                 return self._parse_application_data(data)
             else:
-                logger.error(f"API request failed with status {response.status_code}")
+                logger.error(f"API request failed with status {response.status_code}: {response.text}")
                 return None
         except Exception as e:
             logger.error(f"Error fetching application data: {e}")
@@ -140,7 +140,7 @@ class APIClient:
                 logger.debug(f"CRM ID {crm_id} не найден (404)")
                 return {"address": "", "complex": "", "price": None}
             else:
-                logger.warning(f"API request failed for {crm_id} with status {response.status_code}")
+                logger.warning(f"API request failed for {crm_id} with status {response.status_code}: {response.text}")
                 return {"address": "", "complex": "", "price": None}
         except Exception as e:
             logger.warning(f"Error fetching data for {crm_id}: {e}")

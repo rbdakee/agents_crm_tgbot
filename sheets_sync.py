@@ -219,7 +219,7 @@ class SheetsSyncManager:
             logger.info(f"Синхронизация из SHEET_DEALS завершена: {stats}")
             
         except Exception as e:
-            logger.error(f"Ошибка синхронизации из Google Sheets: {e}")
+            logger.error(f"Ошибка синхронизации из Google Sheets: {e}", exc_info=True)
             stats["errors"] += 1
         finally:
             self.sync_in_progress = False
@@ -325,7 +325,7 @@ class SheetsSyncManager:
             self.last_sync_time = datetime.now()
             logger.info(f"Быстрая синхронизация завершена: {stats}")
         except Exception as e:
-            logger.error(f"Ошибка быстрой синхронизации: {e}")
+            logger.error(f"Ошибка быстрой синхронизации: {e}", exc_info=True)
             stats['errors'] += 1
         finally:
             self.sync_in_progress = False
@@ -622,10 +622,13 @@ class SheetsSyncManager:
                 values = []
             
             # Очищаем и записываем
+            logger.info(f"Очищаем лист SHEET_PROGRESS и записываем {len(values)} строк")
             self.progress_sheet.clear()
             # Пишем заголовок и данные разом
+            logger.info(f"Записываем заголовки: {headers}")
             self.progress_sheet.update('A1', [headers], value_input_option='USER_ENTERED')
             if values:
+                logger.info(f"Записываем данные: {len(values)} строк")
                 self.progress_sheet.update(f'A2', values, value_input_option='USER_ENTERED')
                 
                 # Установим формат DATE для колонок дат, если они присутствуют
@@ -687,7 +690,7 @@ class SheetsSyncManager:
             stats["updated"] = len(values)
             logger.info(f"Выгружено {stats['updated']} строк в SHEET_PROGRESS")
         except Exception as e:
-            logger.error(f"Ошибка выгрузки в Google Sheets (2): {e}")
+            logger.error(f"Ошибка выгрузки в Google Sheets (2): {e}", exc_info=True)
             stats["errors"] += 1
         finally:
             self.sync_in_progress = False
@@ -733,7 +736,7 @@ class SheetsSyncManager:
                 to_sheets_stats = await self.sync_to_sheets()
                 logger.info(f"Синхронизация DB->Sheets(2): {to_sheets_stats}")
             except Exception as e:
-                logger.error(f"Ошибка фоновой синхронизации: {e}")
+                logger.error(f"Ошибка фоновой синхронизации: {e}", exc_info=True)
                 await asyncio.sleep(60)  # Пауза при ошибке
     
     # Вспомогательные методы для парсинга данных
@@ -744,29 +747,13 @@ class SheetsSyncManager:
             return None
         
         try:
+            # Используем более надежный способ добавления месяцев
+            from dateutil.relativedelta import relativedelta
+            
             # Добавляем 2 месяца к дате подписания
-            if date_signed.month <= 10:
-                # Если месяц <= 10, просто добавляем 2
-                expires_month = date_signed.month + 2
-                expires_year = date_signed.year
-            else:
-                # Если месяц 11 или 12, переходим на следующий год
-                expires_month = date_signed.month + 2 - 12
-                expires_year = date_signed.year + 1
+            expires_date = date_signed + relativedelta(months=2)
             
-            # Создаем новую дату
-            expires_date = date_signed.replace(year=expires_year, month=expires_month)
-            
-            # Проверяем, что день существует в новом месяце
-            # Если нет (например, 31 января -> 31 марта, но в марте только 31 день),
-            # то берем последний день месяца
-            try:
-                return expires_date
-            except ValueError:
-                # Если день не существует в новом месяце, берем последний день месяца
-                from calendar import monthrange
-                last_day = monthrange(expires_year, expires_month)[1]
-                return expires_date.replace(day=last_day)
+            return expires_date
                 
         except Exception as e:
             logger.error(f"Ошибка вычисления даты истечения для {date_signed}: {e}")

@@ -58,12 +58,17 @@ class PostgreSQLManager:
                 name = fio_parts[1] if len(fio_parts) > 1 else ''
                 surname_like = f"%{surname.lower()}%"
                 name_like = f"%{name.lower()}%"
+                
+                logger.debug(f"Поиск контрактов для агента: '{agent_name}' -> фамилия: '{surname}', имя: '{name}'")
 
                 where_clause = (
                     "((LOWER(mop) LIKE :surname_like AND LOWER(mop) LIKE :name_like) "
                     "OR (LOWER(rop) LIKE :surname_like AND LOWER(rop) LIKE :name_like) "
                     "OR (LOWER(dd)  LIKE :surname_like AND LOWER(dd)  LIKE :name_like))"
                 )
+                
+                logger.debug(f"SQL WHERE clause: {where_clause}")
+                logger.debug(f"Parameters: surname_like='{surname_like}', name_like='{name_like}'")
 
                 # Получаем общее количество контрактов агента (совпадение по фамилии и имени)
                 count_result = await session.execute(
@@ -88,7 +93,7 @@ class PostgreSQLManager:
                 return contracts, total_count
                 
         except Exception as e:
-            logger.error(f"Ошибка получения контрактов агента {agent_name}: {e}")
+            logger.error(f"Ошибка получения контрактов агента {agent_name}: {e}", exc_info=True)
             return [], 0
     
     async def search_contract_by_crm_id(self, crm_id: str, agent_name: str) -> Optional[Dict]:
@@ -118,7 +123,7 @@ class PostgreSQLManager:
                 return None
                 
         except Exception as e:
-            logger.error(f"Ошибка поиска контракта {crm_id} для агента {agent_name}: {e}")
+            logger.error(f"Ошибка поиска контракта {crm_id} для агента {agent_name}: {e}", exc_info=True)
             return None
     
     async def search_contracts_by_client_name_lazy(self, client_name: str, agent_name: str, page: int = 1, page_size: int = 10) -> Tuple[List[Dict], int]:
@@ -159,7 +164,7 @@ class PostgreSQLManager:
                 return contracts, total_count
                 
         except Exception as e:
-            logger.error(f"Ошибка поиска контрактов по клиенту {client_name}: {e}")
+            logger.error(f"Ошибка поиска контрактов по клиенту {client_name}: {e}", exc_info=True)
             return [], 0
     
     async def update_contract(self, crm_id: str, updates: Dict[str, Any]) -> bool:
@@ -233,7 +238,7 @@ class PostgreSQLManager:
             return None
             
         except Exception as e:
-            logger.error(f"Ошибка поиска агента по телефону {phone}: {e}")
+            logger.error(f"Ошибка поиска агента по телефону {phone}: {e}", exc_info=True)
             return None
     
     async def get_phone_by_agent(self, agent_name: str) -> Optional[str]:
@@ -263,7 +268,7 @@ class PostgreSQLManager:
             return None
             
         except Exception as e:
-            logger.error(f"Ошибка поиска телефона агента {agent_name}: {e}")
+            logger.error(f"Ошибка поиска телефона агента {agent_name}: {e}", exc_info=True)
             return None
     
     def is_valid_phone(self, phone: str) -> bool:

@@ -648,8 +648,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
-    # Отвечаем на callback query сразу
-    await query.answer()
+    # Отвечаем на callback query сразу, но с обработкой ошибок
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
+        # Продолжаем выполнение даже если не удалось ответить на callback
 
     if data == "my_contracts":
         await my_contracts(update, context)

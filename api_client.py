@@ -325,24 +325,48 @@ class APIClient:
         complex_data = real_property.get('residentialComplexDto', {})
         address_data = real_property.get('addressDto', {})
         
-        complex_name = complex_data.get('houseName', 'Неизвестный ЖК')
+        # Проверяем, что complex_data является словарем
+        if complex_data and isinstance(complex_data, dict):
+            complex_name = complex_data.get('houseName', 'Неизвестный ЖК')
+        else:
+            complex_name = 'Неизвестный ЖК'
         
         # Формируем адрес с проверками
-        street_name = address_data.get('street', {}).get('nameRu', 'Неизвестная улица')
-        building = address_data.get('building', '')
+        if address_data and isinstance(address_data, dict):
+            street_data = address_data.get('street')
+            if street_data and isinstance(street_data, dict):
+                street_name = street_data.get('nameRu', 'Неизвестная улица')
+            else:
+                street_name = 'Неизвестная улица'
+            
+            building = address_data.get('building', '')
+        else:
+            street_name = 'Неизвестная улица'
+            building = ''
+        
         apartment = real_property.get('apartmentNumber', '')
         address = f"{street_name} дом {building}, кв {apartment}" if building and apartment else street_name
         
         area_sqm = real_property.get('totalArea', 0)
         floor = real_property.get('floor', 0)
         rooms = real_property.get('numberOfRooms', 0)
-        housing_class = complex_data.get('housingClass') or 'Комфорт'
+        
+        # Проверяем housing_class с учетом того, что complex_data может быть None
+        if complex_data and isinstance(complex_data, dict):
+            housing_class = complex_data.get('housingClass') or 'Комфорт'
+        else:
+            housing_class = 'Комфорт'
         
         # Агент
         agent = data.get('agentDto', {})
-        agent_name = agent.get('name', '')
-        agent_surname = agent.get('surname', '')
-        agent_phone = self.format_phone(agent.get('phone', ''))
+        if agent and isinstance(agent, dict):
+            agent_name = agent.get('name', '')
+            agent_surname = agent.get('surname', '')
+            agent_phone = self.format_phone(agent.get('phone', ''))
+        else:
+            agent_name = ''
+            agent_surname = ''
+            agent_phone = ''
         
         # Клиент (пока пустой, нужно будет получать отдельно)
         client_name = ""
@@ -373,6 +397,10 @@ class APIClient:
     def _extract_benefits(self, complex_data: Dict, real_property_data: Dict) -> List[str]:
         """Извлекает достоинства из данных комплекса и недвижимости"""
         benefits = []
+        
+        # Проверяем, что complex_data не None
+        if not complex_data or not isinstance(complex_data, dict):
+            return benefits
         
         # Состояние/ремонт квартиры из generalCharacteristicsDto
         general_chars = real_property_data.get('generalCharacteristicsDto', {})

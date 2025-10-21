@@ -22,6 +22,7 @@ class CollageInput:
     photos: List[str] = field(default_factory=list)
     client_name: str = ''
     rop: str = ''
+    mop: str = ''
     agent_phone: str = ''
     action_banner: str = ''
 
@@ -266,8 +267,9 @@ COLLAGE_TEMPLATE = """
       </div>
       <div class="price-bubble">${price}</div>
       <div class="meta">
-        <div class="client">${client_name}</div>
+        <!-- <div class="client">${client_name}</div> -->
         <div class="sub">РОП: ${rop}</div>
+        <div class="sub">МОП: ${mop}</div>
         <div class="sub">CRM ID: ${crm_id}</div>
       </div>
     </div>
@@ -294,7 +296,7 @@ COLLAGE_TEMPLATE = """
       <div class="photos">${photos}</div>
 
       <div class="footer">
-        <div>${agent_phone}</div>
+        <!-- <div>${agent_phone}</div> -->
         <div>ivitrina.kz</div>
       </div>
     </div>
@@ -339,6 +341,7 @@ def _build_html(ci: CollageInput) -> str:
         housing_class=html_escape.escape(ci.housing_class or '-'),
         client_name=html_escape.escape(ci.client_name or ''),
         rop=html_escape.escape(ci.rop or ''),
+        mop=html_escape.escape(ci.mop or ''),
         agent_phone=html_escape.escape(ci.agent_phone or '8 777 777 7777'),
         cover=cover,
         logo=_asset_url('logo.png'),

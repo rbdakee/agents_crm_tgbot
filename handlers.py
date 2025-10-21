@@ -750,23 +750,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Получаю данные из CRM...")
         
         try:
-            # Получаем данные из API
-            collage_input = await get_collage_data_from_api(crm_id)
+            # Получаем данные контракта из базы данных
+            agent_name = context.user_data.get('agent_name')
+            db_contract = None
+            if agent_name:
+                db_manager = await get_db_manager()
+                db_contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
+            
+            # Получаем данные из API с данными контракта
+            collage_input = await get_collage_data_from_api(crm_id, db_contract)
             if not collage_input:
                 await query.edit_message_text("❌ Не удалось получить данные из CRM. Проверьте CRM ID.")
                 return
             
             # Получаем имя клиента из базы данных
-            agent_name = context.user_data.get('agent_name')
-            if agent_name:
-                db_manager = await get_db_manager()
-                contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
-                if contract and contract.get('Имя клиента и номер'):
-                    client_info = contract['Имя клиента и номер']
-                    # Извлекаем только имя клиента (до двоеточия) и очищаем от лишних символов
-                    raw_client_name = client_info.split(':')[0].strip()
-                    client_name = clean_client_name(raw_client_name)
-                    collage_input.client_name = client_name
+            if db_contract and db_contract.get('Имя клиента и номер'):
+                client_info = db_contract['Имя клиента и номер']
+                # Извлекаем только имя клиента (до двоеточия) и очищаем от лишних символов
+                raw_client_name = client_info.split(':')[0].strip()
+                client_name = clean_client_name(raw_client_name)
+                collage_input.client_name = client_name
             
             # Сохраняем данные для пользователя
             user_collage_inputs[user_id] = collage_input
@@ -991,7 +994,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         
         field_names = {
-            'client': 'имя клиента',
             'complex': 'название ЖК',
             'address': 'адрес',
             'area': 'площадь',
@@ -1000,7 +1002,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'price': 'цену',
             'class': 'класс жилья',
             'rop': 'имя РОП',
-            'phone': 'номер телефона агента',
+            'mop': 'имя МОП',
             'benefits': 'достоинства'
         }
         
@@ -1113,21 +1115,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Перейдем заново к действию collage_build_
             await update.callback_query.answer("🔄 Переделываю коллаж...")
             
-            collage_input = await get_collage_data_from_api(crm_id)
+            # Получаем данные контракта из базы данных
+            agent_name = context.user_data.get('agent_name')
+            db_contract = None
+            if agent_name:
+                db_manager = await get_db_manager()
+                db_contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
+            
+            collage_input = await get_collage_data_from_api(crm_id, db_contract)
             if not collage_input:
                 await update.callback_query.answer("❌ Не удалось получить данные из CRM. Проверьте CRM ID.")
                 return
 
             # Получаем имя клиента из базы данных для корректного имени
-            agent_name = context.user_data.get('agent_name')
-            if agent_name:
-                db_manager = await get_db_manager()
-                contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
-                if contract and contract.get('Имя клиента и номер'):
-                    client_info = contract['Имя клиента и номер']
-                    raw_client_name = client_info.split(':')[0].strip()
-                    client_name = clean_client_name(raw_client_name)
-                    collage_input.client_name = client_name
+            if db_contract and db_contract.get('Имя клиента и номер'):
+                client_info = db_contract['Имя клиента и номер']
+                raw_client_name = client_info.split(':')[0].strip()
+                client_name = clean_client_name(raw_client_name)
+                collage_input.client_name = client_name
 
             user_collage_inputs[user_id] = collage_input
             await show_collage_data_with_edit_buttons(update.callback_query, collage_input, crm_id)
@@ -1864,7 +1869,6 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     
     # Формируем сообщение с данными
     message = f"✅ Данные для коллажа:\n\n"
-    message += f"👤 Клиент: {collage_input.client_name or 'Не указан'}\n"
     message += f"🏢 ЖК: {collage_input.complex_name}\n"
     message += f"📍 Адрес: {collage_input.address}\n"
     message += f"📐 Площадь: {collage_input.area_sqm} м²\n"
@@ -1873,7 +1877,7 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     message += f"💰 Цена: {collage_input.price}\n"
     message += f"🏗️ Класс жилья: {collage_input.housing_class}\n"
     message += f"👤 РОП: {collage_input.rop}\n"
-    message += f"📞 Телефон агента: {collage_input.agent_phone or 'Не указан'}\n\n"
+    message += f"👤 МОП: {collage_input.mop or 'Не указан'}\n\n"
     
     # Достоинства
     if collage_input.benefits:
@@ -1885,26 +1889,25 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     # Создаем кнопки для редактирования
     keyboard = [
         [
-            InlineKeyboardButton("👤 Клиент", callback_data=f"edit_collage_client_{crm_id}"),
-            InlineKeyboardButton("🏢 ЖК", callback_data=f"edit_collage_complex_{crm_id}")
+            InlineKeyboardButton("🏢 ЖК", callback_data=f"edit_collage_complex_{crm_id}"),
+            InlineKeyboardButton("📍 Адрес", callback_data=f"edit_collage_address_{crm_id}")
         ],
         [
-            InlineKeyboardButton("📍 Адрес", callback_data=f"edit_collage_address_{crm_id}"),
-            InlineKeyboardButton("📐 Площадь", callback_data=f"edit_collage_area_{crm_id}")
+            InlineKeyboardButton("📐 Площадь", callback_data=f"edit_collage_area_{crm_id}"),
+            InlineKeyboardButton("🏠 Комнаты", callback_data=f"edit_collage_rooms_{crm_id}")
         ],
         [
-            InlineKeyboardButton("🏠 Комнаты", callback_data=f"edit_collage_rooms_{crm_id}"),
-            InlineKeyboardButton("🏗️ Этаж", callback_data=f"edit_collage_floor_{crm_id}")
-        ],
-        [
-            InlineKeyboardButton("💰 Цена", callback_data=f"edit_collage_price_{crm_id}"),
+            InlineKeyboardButton("🏗️ Этаж", callback_data=f"edit_collage_floor_{crm_id}"),
             InlineKeyboardButton("🏗️ Класс", callback_data=f"edit_collage_class_{crm_id}")
+            
         ],
         [
-            InlineKeyboardButton("👤 РОП", callback_data=f"edit_collage_rop_{crm_id}"),
-            InlineKeyboardButton("📞 Телефон", callback_data=f"edit_collage_phone_{crm_id}")
+            InlineKeyboardButton("👤 МОП", callback_data=f"edit_collage_mop_{crm_id}"),
+            InlineKeyboardButton("👤 РОП", callback_data=f"edit_collage_rop_{crm_id}")
         ],
         [
+            
+            InlineKeyboardButton("💰 Цена", callback_data=f"edit_collage_price_{crm_id}"),
             InlineKeyboardButton("📋 Достоинства", callback_data=f"edit_collage_benefits_{crm_id}")
         ],
         [
@@ -1957,9 +1960,7 @@ async def handle_collage_field_edit(update: Update, context: ContextTypes.DEFAUL
     
     # Обновляем поле
     try:
-        if field == 'client':
-            collage_input.client_name = text
-        elif field == 'complex':
+        if field == 'complex':
             collage_input.complex_name = text
         elif field == 'address':
             collage_input.address = text
@@ -1975,8 +1976,8 @@ async def handle_collage_field_edit(update: Update, context: ContextTypes.DEFAUL
             collage_input.housing_class = text
         elif field == 'rop':
             collage_input.rop = text
-        elif field == 'phone':
-            collage_input.agent_phone = text
+        elif field == 'mop':
+            collage_input.mop = text
         elif field == 'benefits':
             # Разбиваем по строкам и очищаем
             benefits = [line.strip() for line in text.split('\n') if line.strip()]

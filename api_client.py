@@ -503,8 +503,23 @@ class APIClient:
         
         return phone
     
-    def create_collage_input(self, app_data: ApplicationData, photos: List[str] = None) -> CollageInput:
-        """Создает CollageInput из данных API"""
+    def create_collage_input(self, app_data: ApplicationData, db_contract: Dict = None, photos: List[str] = None) -> CollageInput:
+        """Создает CollageInput из данных API и базы данных
+        
+        Args:
+            app_data: Данные из API
+            db_contract: Данные контракта из базы данных (опционально)
+            photos: Список фотографий (опционально)
+        """
+        # Получаем РОП из базы данных, если доступен, иначе из API
+        if db_contract and db_contract.get('РОП'):
+            rop = db_contract['РОП']
+        else:
+            rop = f"{app_data.agent_surname} {app_data.agent_name}"
+        
+        # Получаем МОП из базы данных
+        mop = db_contract.get('МОП', '') if db_contract else ''
+        
         return CollageInput(
             crm_id=app_data.crm_id,
             complex_name=app_data.complex_name,
@@ -517,16 +532,22 @@ class APIClient:
             benefits=app_data.benefits,
             photos=photos or [],
             client_name=app_data.client_name,
-            rop=f"{app_data.agent_surname} {app_data.agent_name}",
+            rop=rop,
+            mop=mop,
             agent_phone=app_data.agent_phone,
             action_banner=""
         )
 
 
-async def get_collage_data_from_api(crm_id: str) -> Optional[CollageInput]:
-    """Получает данные для коллажа из API и создает CollageInput"""
+async def get_collage_data_from_api(crm_id: str, db_contract: Dict = None) -> Optional[CollageInput]:
+    """Получает данные для коллажа из API и создает CollageInput
+    
+    Args:
+        crm_id: CRM ID объекта
+        db_contract: Данные контракта из базы данных (опционально)
+    """
     async with APIClient() as client:
         app_data = await client.get_application_data(crm_id)
         if app_data:
-            return client.create_collage_input(app_data)
+            return client.create_collage_input(app_data, db_contract)
         return None

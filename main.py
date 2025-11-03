@@ -9,7 +9,7 @@ from config import (
     BOT_TOKEN, USE_WEBHOOK, WEBHOOK_URL, WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH, LOG_LEVEL,
     DATABASE_URL, SYNC_ENABLED, SYNC_INTERVAL_MINUTES
 )
-from handlers import setup_handlers, db_stats, manual_sync
+from handlers import setup_handlers, db_stats, manual_sync, manual_sync_with_cats
 from health import start_health_server
 from database_postgres import init_db_manager, get_db_manager
 from sheets_sync import init_sync_manager, get_sync_manager
@@ -89,9 +89,10 @@ async def main():
         # Добавляем команду для статистики БД (только для разработки)
         application.add_handler(CommandHandler("db_stats", db_stats))
         
-        # Добавляем команду для ручной синхронизации
+        # Добавляем команды для ручной синхронизации
         if SYNC_ENABLED:
             application.add_handler(CommandHandler("sync", manual_sync))
+            application.add_handler(CommandHandler("sync_with_cats", manual_sync_with_cats))
         # Команды автоматического обновления категорий удалены (перенесено в full sync)
 
         # Запускаем фоновую синхронизацию

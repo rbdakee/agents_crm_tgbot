@@ -155,10 +155,14 @@ class SheetsSyncManager:
             logger.error(f"Ошибка создания таблицы: {e}")
             raise
     
-    async def sync_from_sheets(self) -> Dict[str, int]:
+    async def sync_from_sheets(self, update_categories: bool = False) -> Dict[str, int]:
         """Полная синхронизация из Google Sheets (1) в PostgreSQL.
         Источник истины — первая таблица (SHEET_DEALS). Удаляет записи из БД,
-        если их CRM ID отсутствует в SHEET_DEALS."""
+        если их CRM ID отсутствует в SHEET_DEALS.
+        
+        Args:
+            update_categories: Если True, то категории будут пересчитываться и обновляться.
+                              Если False, категории не трогаются (только для новых записей устанавливается 'С')."""
         if self.sync_in_progress:
             logger.warning("Синхронизация уже выполняется, пропускаем")
             return {"skipped": 1}
@@ -212,8 +216,19 @@ class SheetsSyncManager:
                                 if area_f is not None:
                                     property_data['krisha_price'] = int(roof * area_f) if (roof is not None) else None
                                     property_data['vitrina_price'] = int(window * area_f) if (window is not None) else None
+                                # Вычисляем категорию при необходимости
+                                if update_categories:
+                                    category_value = self._compute_category(property_data, third_map)
+                                    property_data['category'] = category_value
                     except Exception:
-                        pass
+                        # Если произошла ошибка при вычислении категории
+                        if update_categories:
+                            property_data['category'] = 'С'
+
+                    # Гарантируем категорию 'С' при режиме обновления категорий,
+                    # если ни одно из условий не сработало и категория так и не выставлена
+                    if update_categories and not property_data.get('category'):
+                        property_data['category'] = 'С'
                     # На первой синхронизации мы НЕ должны перетирать прогресс-поля.
                     # В _upsert_property ниже реализована логика "обновлять только изменившиеся поля",
                     # а здесь фиксируем источник изменений только для новых записей.
@@ -334,14 +349,6 @@ class SheetsSyncManager:
                                     except Exception:
                                         pass
                             
-                            # Расчёт категории для новой записи
-                            category_value = 'С'
-                            try:
-                                category_value = self._compute_category_for_insert(property_data, third_map, new_crm_data.get(crm_id, {}))
-                            except Exception:
-                                category_value = 'С'
-                            property_data['category'] = category_value
-
                             # Сохраняем score и производные цены для новых записей
                             try:
                                 complex_name = property_data.get('complex') or ''
@@ -359,6 +366,17 @@ class SheetsSyncManager:
                                             property_data['vitrina_price'] = int(window * area_f) if (window is not None) else None
                             except Exception:
                                 pass
+
+                            # Расчёт категории для новой записи (после установки всех необходимых данных)
+                            category_value = 'С'
+                            try:
+                                computed_category = self._compute_category_for_insert(property_data, third_map, new_crm_data.get(crm_id, {}))
+                                if computed_category and computed_category.strip():
+                                    category_value = computed_category
+                            except Exception:
+                                category_value = 'С'
+                            # Гарантируем, что категория всегда установлена
+                            property_data['category'] = category_value if category_value and category_value.strip() else 'С'
 
                             property_data['created_at'] = now
                             property_data['last_modified_at'] = now
@@ -510,6 +528,34 @@ class SheetsSyncManager:
                     return 'B'
         return 'C'
 
+    def _compute_category(self, property_data: Dict[str, Any], third_map: Dict[str, Dict]) -> str:
+        """Вычисляет категорию для записи на основе property_data и third_map.
+        
+        Используется как для новых записей, так и для обновления существующих.
+        Берёт area из property_data (может быть из CRM API или из БД).
+        """
+        # Берём complex только из property_data (SQL/Sheets). Если его нет — сразу 'С'
+        complex_name = property_data.get('complex') or ''
+        if not complex_name or not third_map:
+            return 'С'
+        key = self._find_by_variants(complex_name, third_map)
+        if not key:
+            return 'С'
+        params = third_map.get(key) or {}
+        roof = params.get('roof')
+        window = params.get('window')
+        score = params.get('score')
+        # Площадь берём из property_data (может быть из CRM API или из БД)
+        area = property_data.get('area')
+        try:
+            area = float(area) if area is not None else None
+        except Exception:
+            area = None
+        contract_price = property_data.get('contract_price')
+        window_price = (window * area) if (window is not None and area is not None) else None
+        roof_price = (roof * area) if (roof is not None and area is not None) else None
+        return self._assign_category(contract_price, window_price, roof_price, score)
+    
     def _compute_category_for_insert(self, property_data: Dict[str, Any], third_map: Dict[str, Dict], api_data: Dict[str, Any]) -> str:
         # Берём complex только из property_data (SQL/Sheets). Если его нет — сразу 'С'
         complex_name = property_data.get('complex') or ''
@@ -748,6 +794,9 @@ class SheetsSyncManager:
                     # добавляем вычисляемые поля, чтобы не было рассинхронизации
                     'area','krisha_price','vitrina_price','score'
                 }
+                # Добавляем category только если она присутствует в property_data (т.е. была вычислена)
+                if 'category' in property_data:
+                    deals_readonly_fields.add('category')
                 update_data = {k: v for k, v in property_data.items() if k in deals_readonly_fields and v is not None}
                 update_data['last_modified_at'] = datetime.now()
                 
@@ -800,7 +849,7 @@ class SheetsSyncManager:
                 present_keys = [k for k in rows[0].keys() if k not in excluded]
                 desired_order = [
                     'crm_id','date_signed','contract_number','mop','rop','dd','client_name','address','complex',
-                    'area','contract_price','expires','category','krisha_price','vitrina_price','score',
+                    'area','contract_price','expires','krisha_price','vitrina_price','score','category',
                     'collage','prof_collage','krisha','instagram','tiktok','mailing','stream','shows','analytics',
                     'price_update','provide_analytics','push_for_price','status'
                 ]
@@ -834,7 +883,7 @@ class SheetsSyncManager:
             else:
                 headers = [
                     'crm_id','date_signed','contract_number','mop','rop','dd','client_name','address','complex',
-                    'area','contract_price','expires','category','krisha_price','vitrina_price','score','collage','prof_collage','krisha','instagram','tiktok',
+                    'area','contract_price','expires','krisha_price','vitrina_price','score','category','collage','prof_collage','krisha','instagram','tiktok',
                     'mailing','stream','shows','analytics','price_update','provide_analytics','push_for_price','status'
                 ]
                 values = []

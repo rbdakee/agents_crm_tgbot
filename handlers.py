@@ -3242,7 +3242,7 @@ async def update_contract_status(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная синхронизация данных из Google Sheets (только для @rbdakee)"""
+    """Ручная синхронизация данных из Google Sheets БЕЗ обновления категорий (только для @rbdakee)"""
     try:
         from sheets_sync import get_sync_manager
         
@@ -3254,10 +3254,11 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить полную синхронизацию")
             return
         
-        await update.message.reply_text("🔄 Начинаю полную синхронизацию...")
+        await update.message.reply_text("🔄 Начинаю полную синхронизацию (без обновления категорий)...")
         
         sync_manager = await get_sync_manager()
-        sync_stats = await sync_manager.sync_from_sheets()
+        # Синхронизация БЕЗ обновления категорий
+        sync_stats = await sync_manager.sync_from_sheets(update_categories=False)
         # После импорта из Sheets(1) сразу выгружаем в Sheets(2)
         to_sheets_stats = await sync_manager.sync_to_sheets()
         
@@ -3271,9 +3272,46 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"• Ошибок: {to_sheets_stats.get('errors', 0)}\n"
         
         await update.message.reply_text(message)
-        logger.info(f"Полная синхронизация выполнена пользователем {update.effective_user.username} (ID: {update.effective_user.id})")
+        logger.info(f"Полная синхронизация (без категорий) выполнена пользователем {update.effective_user.username} (ID: {update.effective_user.id})")
     except Exception as e:
         logger.error(f"Ошибка ручной синхронизации: {e}")
+        await update.message.reply_text(f"❌ Ошибка синхронизации: {str(e)}")
+
+
+async def manual_sync_with_cats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручная синхронизация данных из Google Sheets С обновлением категорий (только для @rbdakee)"""
+    try:
+        from sheets_sync import get_sync_manager
+        
+        # Проверяем, что команду вызвал авторизованный пользователь @rbdakee
+        authorized_user_id = 893220231  # User ID для @rbdakee
+        
+        if update.effective_user.id != authorized_user_id:
+            await update.message.reply_text("❌ У вас нет прав для выполнения полной синхронизации")
+            logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить полную синхронизацию с категориями")
+            return
+        
+        await update.message.reply_text("🔄 Начинаю полную синхронизацию с обновлением категорий...")
+        
+        sync_manager = await get_sync_manager()
+        # Синхронизация С обновлением категорий
+        sync_stats = await sync_manager.sync_from_sheets(update_categories=True)
+        # После импорта из Sheets(1) сразу выгружаем в Sheets(2)
+        to_sheets_stats = await sync_manager.sync_to_sheets()
+        
+        message = f"✅ Полная синхронизация с категориями завершена!\n\n"
+        message += f"📥 Sheets(1) → DB:\n"
+        message += f"• Создано: {sync_stats.get('created', 0)}\n"
+        message += f"• Обновлено: {sync_stats.get('updated', 0)}\n"
+        message += f"• Ошибок: {sync_stats.get('errors', 0)}\n\n"
+        message += f"📤 DB → Sheets(2):\n"
+        message += f"• Выгружено строк: {to_sheets_stats.get('updated', 0)}\n"
+        message += f"• Ошибок: {to_sheets_stats.get('errors', 0)}\n"
+        
+        await update.message.reply_text(message)
+        logger.info(f"Полная синхронизация (с категориями) выполнена пользователем {update.effective_user.username} (ID: {update.effective_user.id})")
+    except Exception as e:
+        logger.error(f"Ошибка ручной синхронизации с категориями: {e}")
         await update.message.reply_text(f"❌ Ошибка синхронизации: {str(e)}")
 
 

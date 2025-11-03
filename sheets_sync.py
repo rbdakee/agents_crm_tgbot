@@ -44,6 +44,7 @@ class SheetsSyncManager:
         self.sheet_id = config['SHEET_ID']
         self.deals_sheet_gid = config['FIRST_SHEET_GID']  # SHEET_DEALS
         self.progress_sheet_gid = config['SECOND_SHEET_GID']  # SHEET_PROGRESS
+        self.third_sheet_gid = config.get('THIRD_SHEET_GID')  # SHEET_THIRD (Лист8)
         self.sync_interval_minutes = int(config.get('SYNC_INTERVAL_MINUTES', 10))
         
         # Настройки PostgreSQL
@@ -56,6 +57,10 @@ class SheetsSyncManager:
         # Состояние синхронизации
         self.last_sync_time = None
         self.sync_in_progress = False
+
+    async def _to_thread(self, func, *args, **kwargs):
+        import asyncio
+        return await asyncio.to_thread(func, *args, **kwargs)
         
     def _init_google_sheets(self):
         """Инициализация подключения к Google Sheets"""
@@ -76,6 +81,12 @@ class SheetsSyncManager:
             # Получаем листы
             self.deals_sheet = self.spreadsheet.get_worksheet_by_id(int(self.deals_sheet_gid))
             self.progress_sheet = self.spreadsheet.get_worksheet_by_id(int(self.progress_sheet_gid))
+            self.third_sheet = None
+            try:
+                if self.third_sheet_gid:
+                    self.third_sheet = self.spreadsheet.get_worksheet_by_id(int(self.third_sheet_gid))
+            except Exception:
+                self.third_sheet = None
             
             logger.info("Подключение к Google Sheets установлено")
             
@@ -168,6 +179,14 @@ class SheetsSyncManager:
                 await self._enrich_with_crm_data(deals_data)
             else:
                 logger.info("Обогащение данными из CRM API отключено")
+
+            # Грузим карту третьего листа для расчёта категории
+            third_map = {}
+            if self.third_sheet is not None:
+                try:
+                    third_map = await self._build_third_sheet_map()
+                except Exception as e:
+                    logger.warning(f"Не удалось загрузить Лист8: {e}")
             
             # Синхронизируем с базой данных: upsert сделок и удаление отсутствующих
             logger.info(f"Начинаем запись {len(deals_data)} записей в базу данных...")
@@ -178,6 +197,23 @@ class SheetsSyncManager:
                     crm_id = deal['crm_id']
                     # заполняем техн. поля
                     property_data = deal.copy()
+                    # Запись score и производных цен восстановлена (если area уже есть)
+                    try:
+                        complex_name = property_data.get('complex') or ''
+                        area_val = property_data.get('area')
+                        area_f = float(area_val) if area_val is not None else None
+                        if complex_name and third_map:
+                            key = self._find_by_variants(complex_name, third_map)
+                            if key:
+                                params = third_map.get(key) or {}
+                                roof = params.get('roof')
+                                window = params.get('window')
+                                property_data['score'] = params.get('score')
+                                if area_f is not None:
+                                    property_data['krisha_price'] = int(roof * area_f) if (roof is not None) else None
+                                    property_data['vitrina_price'] = int(window * area_f) if (window is not None) else None
+                    except Exception:
+                        pass
                     # На первой синхронизации мы НЕ должны перетирать прогресс-поля.
                     # В _upsert_property ниже реализована логика "обновлять только изменившиеся поля",
                     # а здесь фиксируем источник изменений только для новых записей.
@@ -249,6 +285,14 @@ class SheetsSyncManager:
             deals_by_crm: Dict[str, Dict] = {row['crm_id']: row for row in deals_data}
             deals_crm_ids = set(deals_by_crm.keys())
 
+            # Подготовим карту из третьего листа для расчёта категории (если доступен)
+            third_map = {}
+            if self.third_sheet is not None:
+                try:
+                    third_map = await self._build_third_sheet_map()
+                except Exception as e:
+                    logger.warning(f"Не удалось загрузить Лист8 для категорий: {e}")
+
             async with self.async_session() as session:
                 # Получаем текущие CRM ID из БД одним запросом
                 result = await session.execute(text("SELECT crm_id FROM properties"))
@@ -284,7 +328,38 @@ class SheetsSyncManager:
                                     property_data['complex'] = api_data['complex']
                                 if api_data.get('price') is not None:
                                     property_data['contract_price'] = api_data['price']
+                                if api_data.get('area') is not None:
+                                    try:
+                                        property_data['area'] = float(api_data['area'])
+                                    except Exception:
+                                        pass
                             
+                            # Расчёт категории для новой записи
+                            category_value = 'С'
+                            try:
+                                category_value = self._compute_category_for_insert(property_data, third_map, new_crm_data.get(crm_id, {}))
+                            except Exception:
+                                category_value = 'С'
+                            property_data['category'] = category_value
+
+                            # Сохраняем score и производные цены для новых записей
+                            try:
+                                complex_name = property_data.get('complex') or ''
+                                area_val = property_data.get('area')
+                                area_f = float(area_val) if area_val is not None else None
+                                if complex_name and third_map:
+                                    key = self._find_by_variants(complex_name, third_map)
+                                    if key:
+                                        params = third_map.get(key) or {}
+                                        roof = params.get('roof')
+                                        window = params.get('window')
+                                        property_data['score'] = params.get('score')
+                                        if area_f is not None:
+                                            property_data['krisha_price'] = int(roof * area_f) if (roof is not None) else None
+                                            property_data['vitrina_price'] = int(window * area_f) if (window is not None) else None
+                            except Exception:
+                                pass
+
                             property_data['created_at'] = now
                             property_data['last_modified_at'] = now
                             property_data['last_modified_by'] = 'SHEET'
@@ -332,11 +407,138 @@ class SheetsSyncManager:
 
         return stats
     
+    def _norm_complex(self, x: str) -> str:
+        import re
+        s = (x or '').lower()
+        for token in ['жк', 'жилой комплекс', 'residence', 'residential', 'complex']:
+            s = s.replace(token, ' ')
+        for ch in ['"', '\'', '«', '»', '.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '/', '\\', '-', '–', '_']:
+            s = s.replace(ch, ' ')
+        s = re.sub(r"\bблок\s+[a-zа-я0-9]+\b", " ", s)
+        s = re.sub(r"\bочередь\b", " ", s)
+        s = re.sub(r"\b(\d+)\s*\-\s*\d+\b", r"\1", s)
+        s = ' '.join(s.split())
+        synonyms = {
+            'buqar': 'бухар', 'bukhar': 'бухар', 'buqarjyrau': 'бухаржырау', 'jyrau': 'жырау',
+            'qalashyq': 'калашык', 'qalashy': 'калашык', 'exclusive': 'эксклюзив',
+            'dauletti': 'даулетти', 'qalashyk': 'калашык'
+        }
+        tokens = s.split()
+        norm_tokens = []
+        for t in tokens:
+            norm_tokens.append(synonyms.get(t, t))
+        return ' '.join(norm_tokens)
+
+    async def _build_third_sheet_map(self) -> Dict[str, Dict[str, float]]:
+        values = await self._to_thread(self.third_sheet.get_all_values)
+        if not values:
+            return {}
+        header_idx = 0
+        for i, r in enumerate(values):
+            line = ' '.join(r).lower()
+            if ('жк' in line) or ('крыша' in line) or ('витрина' in line) or ('общий балл' in line):
+                header_idx = i
+                break
+        header = values[header_idx] if values else []
+        # A=ЖК, B=Крыша, C=Общий балл, D=Витрина
+        def to_float_safe(v):
+            try:
+                s = str(v).replace(' ', '').replace('\u00A0', '').replace(',', '.')
+                return float(s) if s.strip() else None
+            except Exception:
+                return None
+        mp = {}
+        import re
+        for i, row in enumerate(values):
+            if i <= header_idx:
+                continue
+            complex_name = (row[0] if len(row) > 0 else '').strip()
+            if not complex_name:
+                continue
+            key = self._norm_complex(complex_name)
+            roof = to_float_safe(row[1] if len(row) > 1 else '')
+            score = to_float_safe(row[2] if len(row) > 2 else '')
+            window = to_float_safe(row[3] if len(row) > 3 else '')
+            mp[key] = {'roof': roof, 'score': score, 'window': window}
+            key_variant = re.sub(r"\b(\d+)\s*\-\s*\d+\b", r"\1", key)
+            if key_variant != key and key_variant not in mp:
+                mp[key_variant] = mp[key]
+        return mp
+
+    def _find_by_variants(self, raw_name: str, mp: Dict[str, Dict]) -> Optional[str]:
+        base = self._norm_complex(raw_name)
+        parts = base.split()
+        if not parts:
+            return None
+        def all_parts_in_key(parts_list: List[str], key: str) -> bool:
+            for p in parts_list:
+                if p and p not in key:
+                    return False
+            return True
+        for cut in range(0, len(parts)):
+            variant_parts = [p for p in parts[:len(parts)-cut] if not p.isdigit()]
+            if not variant_parts:
+                continue
+            variant_str = ' '.join(variant_parts)
+            if variant_str in mp:
+                return variant_str
+            for key in mp.keys():
+                if all_parts_in_key(variant_parts, key):
+                    return key
+        return None
+
+    def _assign_category(self, contract_price, window_price, roof_price, score) -> str:
+        def is_num(x):
+            return isinstance(x, (int, float)) and x is not None
+        score_is_num = is_num(score)
+        if score_is_num:
+            if all(is_num(x) for x in [contract_price, window_price, roof_price]):
+                if (window_price <= contract_price <= roof_price) and (score > 8):
+                    return 'A'
+                elif ((contract_price < window_price) or (contract_price > roof_price)) or (5 <= score <= 8):
+                    return 'B'
+                elif (contract_price > roof_price) and (score < 5):
+                    return 'C'
+        else:
+            if all(is_num(x) for x in [contract_price, window_price, roof_price]):
+                if (window_price <= contract_price <= roof_price):
+                    return 'B'
+            if (window_price is None) or (roof_price is None):
+                if is_num(score) and (score > 8):
+                    return 'A'
+                elif is_num(score) and (5 <= score <= 8):
+                    return 'B'
+        return 'C'
+
+    def _compute_category_for_insert(self, property_data: Dict[str, Any], third_map: Dict[str, Dict], api_data: Dict[str, Any]) -> str:
+        # Берём complex только из property_data (SQL/Sheets). Если его нет — сразу 'С'
+        complex_name = property_data.get('complex') or ''
+        if not complex_name or not third_map:
+            return 'С'
+        key = self._find_by_variants(complex_name, third_map)
+        if not key:
+            return 'С'
+        params = third_map.get(key) or {}
+        roof = params.get('roof')
+        window = params.get('window')
+        score = params.get('score')
+        area = api_data.get('area')  # площадь — только для расчёта
+        try:
+            area = float(area) if area is not None else None
+        except Exception:
+            area = None
+        contract_price = property_data.get('contract_price')
+        window_price = (window * area) if (window is not None and area is not None) else None
+        roof_price = (roof * area) if (roof is not None and area is not None) else None
+        return self._assign_category(contract_price, window_price, roof_price, score)
+
+    # Тестовый метод удалён по требованию
+    
     async def _load_deals_sheet(self) -> List[Dict]:
         """Загружает данные из таблицы SHEET_DEALS (только поля из Sheets)"""
         try:
             # Читаем значения напрямую и берём только столбцы A..G (7 столбцов)
-            values = self.deals_sheet.get_all_values()
+            values = await self._to_thread(self.deals_sheet.get_all_values)
             if not values:
                 raise RuntimeError("Лист пуст или недоступен")
             # Первая строка — заголовки, игнорируем их содержимое и жёстко маппим A..G на EXPECTED_DEALS_HEADERS
@@ -384,7 +586,7 @@ class SheetsSyncManager:
             return []
 
     async def _enrich_with_crm_data(self, deals_data: List[Dict]):
-        """Обогащает данные из Google Sheets данными из CRM API для полей address, complex, contract_price"""
+        """Обогащает данные из Google Sheets данными из CRM API для полей address, complex, contract_price, area"""
         if not deals_data:
             return
         
@@ -419,6 +621,12 @@ class SheetsSyncManager:
                         if api_data.get('price') is not None:
                             deal['contract_price'] = api_data['price']
                             updated = True
+                        if api_data.get('area') is not None:
+                            try:
+                                deal['area'] = float(api_data['area'])
+                                updated = True
+                            except Exception:
+                                pass
                         
                         if updated:
                             updated_count += 1
@@ -453,7 +661,7 @@ class SheetsSyncManager:
         """Загружает данные из таблицы SHEET_PROGRESS (можно изменять)"""
         try:
             # Читаем значения напрямую
-            values = self.progress_sheet.get_all_values()
+            values = await self._to_thread(self.progress_sheet.get_all_values)
             if not values:
                 return []
 
@@ -533,12 +741,14 @@ class SheetsSyncManager:
             exists = result.fetchone() is not None
             
             if exists:
-                # Обновляем существующую запись: поля из deals (read-only) + поля из CRM API
+                # Обновляем существующую запись: базовые поля из deals + вычисленные поля из API/Лист3
                 deals_readonly_fields = {
                     'date_signed','contract_number','mop','rop','dd',
-                    'client_name','address','complex','contract_price','expires'
+                    'client_name','address','complex','contract_price','expires',
+                    # добавляем вычисляемые поля, чтобы не было рассинхронизации
+                    'area','krisha_price','vitrina_price','score'
                 }
-                update_data = {k: v for k, v in property_data.items() if k in deals_readonly_fields}
+                update_data = {k: v for k, v in property_data.items() if k in deals_readonly_fields and v is not None}
                 update_data['last_modified_at'] = datetime.now()
                 
                 set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
@@ -585,9 +795,17 @@ class SheetsSyncManager:
             
             # Готовим заголовки и значения
             if rows:
-                # Исключаем мета-колонки
+                # Исключаем мета-колонки и формируем упорядоченный список заголовков
                 excluded = {"last_modified_by", "last_modified_at", "created_at"}
-                headers = [k for k in rows[0].keys() if k not in excluded]
+                present_keys = [k for k in rows[0].keys() if k not in excluded]
+                desired_order = [
+                    'crm_id','date_signed','contract_number','mop','rop','dd','client_name','address','complex',
+                    'area','contract_price','expires','category','krisha_price','vitrina_price','score',
+                    'collage','prof_collage','krisha','instagram','tiktok','mailing','stream','shows','analytics',
+                    'price_update','provide_analytics','push_for_price','status'
+                ]
+                # Сначала желаемый порядок, затем оставшиеся поля, чтобы ничего не потерять
+                headers = [h for h in desired_order if h in present_keys] + [k for k in present_keys if k not in set(desired_order)]
                 def _to_cell_value(v: Any) -> Any:
                     # Приводим типы к сериализуемым для Google Sheets
                     if v is None:
@@ -616,20 +834,20 @@ class SheetsSyncManager:
             else:
                 headers = [
                     'crm_id','date_signed','contract_number','mop','rop','dd','client_name','address','complex',
-                    'contract_price','expires','category','collage','prof_collage','krisha','instagram','tiktok',
+                    'area','contract_price','expires','category','krisha_price','vitrina_price','score','collage','prof_collage','krisha','instagram','tiktok',
                     'mailing','stream','shows','analytics','price_update','provide_analytics','push_for_price','status'
                 ]
                 values = []
             
             # Очищаем и записываем
             logger.info(f"Очищаем лист SHEET_PROGRESS и записываем {len(values)} строк")
-            self.progress_sheet.clear()
+            await self._to_thread(self.progress_sheet.clear)
             # Пишем заголовок и данные разом
             logger.info(f"Записываем заголовки: {headers}")
-            self.progress_sheet.update('A1', [headers], value_input_option='USER_ENTERED')
+            await self._to_thread(self.progress_sheet.update, 'A1', [headers], value_input_option='USER_ENTERED')
             if values:
                 logger.info(f"Записываем данные: {len(values)} строк")
-                self.progress_sheet.update(f'A2', values, value_input_option='USER_ENTERED')
+                await self._to_thread(self.progress_sheet.update, 'A2', values, value_input_option='USER_ENTERED')
                 
                 # Установим формат DATE для колонок дат, если они присутствуют
                 try:
@@ -683,7 +901,7 @@ class SheetsSyncManager:
                                 }
                             })
                         # Выполняем пакетное обновление непосредственно через клиент
-                        self.spreadsheet.batch_update({'requests': requests})
+                        await self._to_thread(self.spreadsheet.batch_update, {'requests': requests})
                 except Exception as fmt_err:
                     logger.warning(f"Не удалось применить формат даты: {fmt_err}")
             

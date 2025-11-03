@@ -27,6 +27,7 @@ PROFILE_URL = os.getenv('PROFILE_URL', 'https://um.jurta.kz/api/profile')
 SHEET_ID = os.getenv('SHEET_ID')  # ID Google Spreadsheet
 FIRST_SHEET_GID = os.getenv('FIRST_SHEET_GID')  # GID первого листа (SHEET_DEALS - только чтение)
 SECOND_SHEET_GID = os.getenv('SECOND_SHEET_GID')  # GID второго листа (SHEET_PROGRESS - можно изменять)
+THIRD_SHEET_GID = os.getenv('THIRD_SHEET_GID')  # GID третьего листа ("Лист8")
 
 # PostgreSQL Database
 DATABASE_URL = os.getenv('DATABASE_URL')  # URL подключения к PostgreSQL
@@ -60,3 +61,10 @@ HEALTH_CHECK_PORT = int(os.getenv('HEALTH_CHECK_PORT', '8081'))
 SYNC_INTERVAL_MINUTES = int(os.getenv('SYNC_INTERVAL_MINUTES', '5'))  # Интервал синхронизации в минутах
 SYNC_ENABLED = os.getenv('SYNC_ENABLED', 'true').lower() == 'true'  # Включить/выключить синхронизацию
 CRM_API_ENRICHMENT = os.getenv('CRM_API_ENRICHMENT', 'true').lower() == 'true'  # Включить/выключить обогащение данными из CRM API
+
+# Роли и доступы
+# Комма-разделенный список 10-значных телефонов (без +7/8), которым назначается роль VIEW (только просмотр)
+_ADMIN_VIEW_PHONES_ENV = os.getenv('ADMIN_VIEW_PHONES', '').strip()
+ADMIN_VIEW_PHONES = set(
+    p.strip() for p in _ADMIN_VIEW_PHONES_ENV.split(',') if p.strip()
+)

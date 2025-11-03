@@ -72,7 +72,7 @@ class APIClient:
             batch_size: Размер батча (по умолчанию 200)
             
         Returns:
-            Словарь {crm_id: {address, complex, price}} с данными из API
+            Словарь {crm_id: {address, complex, price, area}} с данными из API
         """
         result = {}
         
@@ -135,39 +135,39 @@ class APIClient:
                     return self._extract_crm_fields(data)
                 except Exception as json_error:
                     logger.warning(f"Ошибка парсинга JSON для {crm_id}: {json_error}")
-                    return {"address": "", "complex": "", "price": None}
+                    return {"address": "", "complex": "", "price": None, "area": None}
             elif response.status_code == 404:
                 logger.debug(f"CRM ID {crm_id} не найден (404)")
-                return {"address": "", "complex": "", "price": None}
+                return {"address": "", "complex": "", "price": None, "area": None}
             else:
                 logger.warning(f"API request failed for {crm_id} with status {response.status_code}: {response.text}")
-                return {"address": "", "complex": "", "price": None}
+                return {"address": "", "complex": "", "price": None, "area": None}
         except Exception as e:
             logger.warning(f"Error fetching data for {crm_id}: {e}")
-            return {"address": "", "complex": "", "price": None}
+            return {"address": "", "complex": "", "price": None, "area": None}
 
     def _extract_crm_fields(self, json_data: Dict) -> Dict:
-        """Извлекает только нужные поля (address, complex, price) из JSON ответа API"""
+        """Извлекает только нужные поля (address, complex, price, area) из JSON ответа API"""
         try:
             # Проверяем базовую структуру
             if not json_data:
                 logger.debug("API ответ пустой")
-                return {"address": "", "complex": "", "price": None}
+                return {"address": "", "complex": "", "price": None, "area": None}
             
             # Проверяем наличие поля success
             if not json_data.get('success', False):
                 logger.debug(f"API вернул success=False: {json_data}")
-                return {"address": "", "complex": "", "price": None}
+                return {"address": "", "complex": "", "price": None, "area": None}
             
             # Проверяем наличие поля data
             if 'data' not in json_data:
                 logger.debug(f"API ответ не содержит поле 'data': {json_data}")
-                return {"address": "", "complex": "", "price": None}
+                return {"address": "", "complex": "", "price": None, "area": None}
             
             data = json_data['data']
             if not data:
                 logger.debug("Поле 'data' пустое")
-                return {"address": "", "complex": "", "price": None}
+                return {"address": "", "complex": "", "price": None, "area": None}
             
             # Цена из sellDataDto
             sell_data = data.get('sellDataDto')
@@ -179,6 +179,7 @@ class APIClient:
             real_property = data.get('realPropertyDto')
             complex_name = ""
             address = ""
+            area_val = None
             
             if real_property and isinstance(real_property, dict):
                 complex_data = real_property.get('residentialComplexDto')
@@ -218,17 +219,20 @@ class APIClient:
                         address_parts.append(f"кв {apartment}")
                     
                     address = ", ".join(address_parts)
+                # Площадь
+                area_val = real_property.get('totalArea')
             
             return {
                 "address": address,
                 "complex": complex_name,
-                "price": price
+                "price": price,
+                "area": area_val
             }
             
         except Exception as e:
             logger.error(f"Ошибка извлечения полей из API ответа: {e}")
             logger.debug(f"Проблемный JSON: {json_data}")
-            return {"address": "", "complex": "", "price": None}
+            return {"address": "", "complex": "", "price": None, "area": None}
 
     async def login_and_get_profile(self, username: str, password: str) -> Optional[Dict]:
         """Получает токен по логину/паролю и затем профиль пользователя.

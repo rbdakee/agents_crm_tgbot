@@ -23,6 +23,10 @@ CREATE TABLE properties (
     
     -- Extra fields (from SHEET_PROGRESS, editable)
     category VARCHAR(100),
+    area DOUBLE PRECISION,
+    krisha_price BIGINT,
+    vitrina_price BIGINT,
+    score DOUBLE PRECISION,
     collage BOOLEAN DEFAULT FALSE,
     prof_collage BOOLEAN DEFAULT FALSE,
     krisha TEXT,

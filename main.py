@@ -54,6 +54,13 @@ async def main():
         # Инициализируем менеджер БД
         await init_db_manager(DATABASE_URL)
         logging.info("Менеджер PostgreSQL инициализирован")
+        # Гарантируем миграцию со снятием бэкапа, если требуется
+        try:
+            db_manager = await get_db_manager()
+            await db_manager.ensure_schema_with_backup()
+        except Exception as e:
+            logging.error(f"Ошибка авто-миграции схемы с бэкапом: {e}")
+            raise
         
         # Инициализируем менеджер синхронизации
         if SYNC_ENABLED:
@@ -61,6 +68,7 @@ async def main():
                 'SHEET_ID': os.getenv('SHEET_ID'),
                 'FIRST_SHEET_GID': os.getenv('FIRST_SHEET_GID'),
                 'SECOND_SHEET_GID': os.getenv('SECOND_SHEET_GID'),
+                'THIRD_SHEET_GID': os.getenv('THIRD_SHEET_GID'),
                 'DATABASE_URL': DATABASE_URL,
                 'SYNC_INTERVAL_MINUTES': SYNC_INTERVAL_MINUTES
             }
@@ -84,6 +92,7 @@ async def main():
         # Добавляем команду для ручной синхронизации
         if SYNC_ENABLED:
             application.add_handler(CommandHandler("sync", manual_sync))
+        # Команды автоматического обновления категорий удалены (перенесено в full sync)
 
         # Запускаем фоновую синхронизацию
         sync_task = None

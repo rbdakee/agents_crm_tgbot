@@ -45,7 +45,7 @@ class SheetsSyncManager:
         self.deals_sheet_gid = config['FIRST_SHEET_GID']  # SHEET_DEALS
         self.progress_sheet_gid = config['SECOND_SHEET_GID']  # SHEET_PROGRESS
         self.third_sheet_gid = config.get('THIRD_SHEET_GID')  # SHEET_THIRD (Лист8)
-        self.sync_interval_minutes = int(config.get('SYNC_INTERVAL_MINUTES', 10))
+        self.sync_interval_minutes = int(config.get('SYNC_INTERVAL_MINUTES', 30))
         
         # Настройки PostgreSQL
         self.db_url = config['DATABASE_URL']

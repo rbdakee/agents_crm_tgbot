@@ -214,10 +214,6 @@ class APIClient:
                                 street_name += f" {building}"
                             address_parts.append(street_name)
                     
-                    apartment = real_property.get('apartmentNumber')
-                    if apartment:
-                        address_parts.append(f"кв {apartment}")
-                    
                     address = ", ".join(address_parts)
                 # Площадь
                 area_val = real_property.get('totalArea')
@@ -348,8 +344,7 @@ class APIClient:
             street_name = 'Неизвестная улица'
             building = ''
         
-        apartment = real_property.get('apartmentNumber', '')
-        address = f"{street_name} дом {building}, кв {apartment}" if building and apartment else street_name
+        address = f"{street_name} дом {building}" if building else street_name
         
         area_sqm = real_property.get('totalArea', 0)
         floor = real_property.get('floor', 0)

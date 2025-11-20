@@ -102,11 +102,11 @@ class APIClient:
                     crm_id = batch_crm_ids[i]
                     if isinstance(result_data, Exception):
                         logger.error(f"Ошибка получения данных для {crm_id}: {result_data}")
-                        result[crm_id] = {"address": "", "complex": "", "price": None}
+                        result[crm_id] = {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
                     elif result_data:
                         result[crm_id] = result_data
                     else:
-                        result[crm_id] = {"address": "", "complex": "", "price": None}
+                        result[crm_id] = {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
                 
                 logger.info(f"Батч {batch_index + 1} завершен: {len(batch_results)} записей")
                 
@@ -118,7 +118,7 @@ class APIClient:
                 logger.error(f"Ошибка при обработке батча {batch_index + 1}: {e}")
                 # Заполняем пустыми данными для этого батча
                 for crm_id in batch_crm_ids:
-                    result[crm_id] = {"address": "", "complex": "", "price": None}
+                    result[crm_id] = {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
         
         logger.info(f"Получение данных из CRM API завершено: {len(result)} записей")
         return result
@@ -135,39 +135,39 @@ class APIClient:
                     return self._extract_crm_fields(data)
                 except Exception as json_error:
                     logger.warning(f"Ошибка парсинга JSON для {crm_id}: {json_error}")
-                    return {"address": "", "complex": "", "price": None, "area": None}
+                    return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
             elif response.status_code == 404:
                 logger.debug(f"CRM ID {crm_id} не найден (404)")
-                return {"address": "", "complex": "", "price": None, "area": None}
+                return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
             else:
                 logger.warning(f"API request failed for {crm_id} with status {response.status_code}: {response.text}")
-                return {"address": "", "complex": "", "price": None, "area": None}
+                return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
         except Exception as e:
             logger.warning(f"Error fetching data for {crm_id}: {e}")
-            return {"address": "", "complex": "", "price": None, "area": None}
+            return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
 
     def _extract_crm_fields(self, json_data: Dict) -> Dict:
-        """Извлекает только нужные поля (address, complex, price, area) из JSON ответа API"""
+        """Извлекает только нужные поля (address, complex, price, area, rooms) из JSON ответа API"""
         try:
             # Проверяем базовую структуру
             if not json_data:
                 logger.debug("API ответ пустой")
-                return {"address": "", "complex": "", "price": None, "area": None}
+                return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
             
             # Проверяем наличие поля success
             if not json_data.get('success', False):
                 logger.debug(f"API вернул success=False: {json_data}")
-                return {"address": "", "complex": "", "price": None, "area": None}
+                return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
             
             # Проверяем наличие поля data
             if 'data' not in json_data:
                 logger.debug(f"API ответ не содержит поле 'data': {json_data}")
-                return {"address": "", "complex": "", "price": None, "area": None}
+                return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
             
             data = json_data['data']
             if not data:
                 logger.debug("Поле 'data' пустое")
-                return {"address": "", "complex": "", "price": None, "area": None}
+                return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
             
             # Цена из sellDataDto
             sell_data = data.get('sellDataDto')
@@ -180,6 +180,7 @@ class APIClient:
             complex_name = ""
             address = ""
             area_val = None
+            rooms_val = None
             
             if real_property and isinstance(real_property, dict):
                 complex_data = real_property.get('residentialComplexDto')
@@ -217,18 +218,21 @@ class APIClient:
                     address = ", ".join(address_parts)
                 # Площадь
                 area_val = real_property.get('totalArea')
+                # Количество комнат
+                rooms_val = real_property.get('numberOfRooms')
             
             return {
                 "address": address,
                 "complex": complex_name,
                 "price": price,
-                "area": area_val
+                "area": area_val,
+                "rooms": rooms_val
             }
             
         except Exception as e:
             logger.error(f"Ошибка извлечения полей из API ответа: {e}")
             logger.debug(f"Проблемный JSON: {json_data}")
-            return {"address": "", "complex": "", "price": None, "area": None}
+            return {"address": "", "complex": "", "price": None, "area": None, "rooms": None}
 
     async def login_and_get_profile(self, username: str, password: str) -> Optional[Dict]:
         """Получает токен по логину/паролю и затем профиль пользователя.

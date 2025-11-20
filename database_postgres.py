@@ -6,7 +6,7 @@
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
-from sqlalchemy import text, func, and_, or_, select, update, Table, Column, String, Integer, BigInteger, Boolean, Date, DateTime, MetaData
+from sqlalchemy import text, func, and_, or_, select, update, Table, Column, String, Integer, BigInteger, Boolean, Date, DateTime, MetaData, Float
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
@@ -34,6 +34,11 @@ properties = Table(
     Column("contract_price", BigInteger),
     Column("expires", Date),
     Column("category", String(100)),
+    Column("area", Float),
+    Column("rooms_count", Integer),
+    Column("krisha_price", BigInteger),
+    Column("vitrina_price", BigInteger),
+    Column("score", Float),
     Column("collage", Boolean),
     Column("prof_collage", Boolean),
     Column("krisha", String),
@@ -50,6 +55,11 @@ properties = Table(
     Column("last_modified_by", String(10)),
     Column("last_modified_at", DateTime),
     Column("created_at", DateTime),
+)
+
+ACTIVE_STATUS_FILTER = or_(
+    properties.c.status.is_(None),
+    func.lower(properties.c.status) != 'реализовано'
 )
 
 class PostgreSQLManager:
@@ -86,7 +96,7 @@ class PostgreSQLManager:
             raise
 
     async def ensure_schema_with_backup(self) -> None:
-        """Проверяет наличие новых колонок (area, krisha_price, vitrina_price, score).
+        """Проверяет наличие новых колонок (area, krisha_price, vitrina_price, score, rooms_count).
         Если отсутствуют — создаёт резервную копию таблицы properties и добавляет недостающие колонки.
         Операция идемпотентная и безопасная: данные не удаляются, ALTER выполняются с IF NOT EXISTS.
         """
@@ -97,11 +107,11 @@ class PostgreSQLManager:
                     """
                     SELECT column_name FROM information_schema.columns
                     WHERE table_name = 'properties'
-                      AND column_name IN ('area','krisha_price','vitrina_price','score')
+                      AND column_name IN ('area','krisha_price','vitrina_price','score','rooms_count')
                     """
                 ))
                 existing = {row.column_name for row in col_check.fetchall()}
-                required = {'area','krisha_price','vitrina_price','score'}
+                required = {'area','krisha_price','vitrina_price','score','rooms_count'}
                 missing = required - existing
                 if not missing:
                     logger.info("Схема таблицы properties уже содержит все новые колонки")
@@ -134,6 +144,8 @@ class PostgreSQLManager:
                     alter_stmts.append("ALTER TABLE properties ADD COLUMN IF NOT EXISTS vitrina_price BIGINT")
                 if 'score' in missing:
                     alter_stmts.append("ALTER TABLE properties ADD COLUMN IF NOT EXISTS score DOUBLE PRECISION")
+                if 'rooms_count' in missing:
+                    alter_stmts.append("ALTER TABLE properties ADD COLUMN IF NOT EXISTS rooms_count INTEGER")
                 for stmt in alter_stmts:
                     await session.execute(text(stmt))
                 await session.commit()
@@ -157,7 +169,7 @@ class PostgreSQLManager:
                 logger.debug(f"Поиск контрактов для агента: '{agent_name}' -> фамилия: '{surname}', имя: '{name}'")
 
                 # WHERE через SQLAlchemy Core
-                def _where(role):
+                def _role_condition(role):
                     if role == 'МОП':
                         return and_(func.lower(properties.c.mop).like(surname_like), func.lower(properties.c.mop).like(name_like))
                     if role == 'РОП':
@@ -169,6 +181,9 @@ class PostgreSQLManager:
                         and_(func.lower(properties.c.rop).like(surname_like), func.lower(properties.c.rop).like(name_like)),
                         and_(func.lower(properties.c.dd).like(surname_like), func.lower(properties.c.dd).like(name_like)),
                     )
+                
+                def _where(role):
+                    return and_(_role_condition(role), ACTIVE_STATUS_FILTER)
 
                 # count
                 stmt_count = select(func.count()).select_from(properties).where(_where(role))
@@ -499,6 +514,11 @@ class PostgreSQLManager:
             'Цена указанная в договоре': db_record.get('contract_price', ''),
             'Истекает': db_record.get('expires', ''),
             'category': db_record.get('category', ''),
+            'area': db_record.get('area'),
+            'rooms_count': db_record.get('rooms_count'),
+            'krisha_price': db_record.get('krisha_price'),
+            'vitrina_price': db_record.get('vitrina_price'),
+            'score': db_record.get('score'),
             'collage': db_record.get('collage', False),
             'prof_collage': db_record.get('prof_collage', False),
             'krisha': db_record.get('krisha', ''),
@@ -1107,7 +1127,11 @@ class PostgreSQLManager:
         try:
             async with self.async_session() as session:
                 col = properties.c.rop if owner_role == 'РОП' else properties.c.dd
-                cond = and_(func.lower(col).like(surname_like), func.lower(col).like(name_like))
+                cond = and_(
+                    func.lower(col).like(surname_like),
+                    func.lower(col).like(name_like),
+                    ACTIVE_STATUS_FILTER
+                )
                 total = (await session.execute(select(func.count()).select_from(properties).where(cond))).scalar() or 0
                 cat_rows = (await session.execute(
                     select(properties.c.category, func.count().label('cnt')).where(cond).group_by(properties.c.category)
@@ -1444,8 +1468,9 @@ class PostgreSQLManager:
                     params['cat'] = cat_upper
                     params['cat_cyr'] = cat_cyr
                 
+                status_filter_sql = " AND (status IS NULL OR LOWER(status) != 'реализовано')"
                 result = await session.execute(
-                    text(f"SELECT * FROM properties WHERE {where_clause} ORDER BY last_modified_at DESC"),
+                    text(f"SELECT * FROM properties WHERE {where_clause}{status_filter_sql} ORDER BY last_modified_at DESC"),
                     params
                 )
                 

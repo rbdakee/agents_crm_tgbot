@@ -134,7 +134,7 @@ COLLAGE_TEMPLATE = """
     .title .label { font-size: 64px; font-weight: 900; letter-spacing: 0.5px; }
     .title .label span { color:#fff; text-transform: uppercase; }
     .address { margin-top: 8px; font-size: 28px; opacity: .95; display:flex; align-items:center; gap:10px; }
-    .address img.loc { width: 40px; height: 40px; filter: drop-shadow(0 1px 1px rgba(0,0,0,.2)); }
+    .address img.loc { width: 40px; height: 40px; filter: drop-shadow(0 1px 1px rgba(0,0,0,.2)); margin-right: 15px; }
 
     /* ===== INFO FOOTER (silver block) ===== */
     .info-footer {
@@ -208,10 +208,10 @@ COLLAGE_TEMPLATE = """
       padding: 6px 8px;
       border-radius: 0;
       font-weight: 700;
-      font-size: 22px;
+      font-size: 34px;
       display: flex;
       align-items: flex-start;
-      gap: 8px;
+      gap: 15px;
       box-shadow: none;
       border: none;
       break-inside: avoid;
@@ -220,7 +220,7 @@ COLLAGE_TEMPLATE = """
       margin-bottom: 4px;
       line-height: 1.2;
     }
-    .benefits-list img.chk { width: 22px; height: 22px; margin-top: 4px; flex-shrink: 0; }
+    .benefits-list img.chk { width: 34px; height: 34px; margin-top: 4px; flex-shrink: 0; margin-right: 12px; }
 
     /* ===== PHOTOS ===== */
     .photos {

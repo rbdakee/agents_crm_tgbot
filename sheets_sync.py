@@ -348,6 +348,11 @@ class SheetsSyncManager:
                                         property_data['area'] = float(api_data['area'])
                                     except Exception:
                                         pass
+                                if api_data.get('rooms') is not None:
+                                    try:
+                                        property_data['rooms_count'] = int(api_data['rooms'])
+                                    except Exception:
+                                        pass
                             
                             # Сохраняем score и производные цены для новых записей
                             try:
@@ -632,7 +637,7 @@ class SheetsSyncManager:
             return []
 
     async def _enrich_with_crm_data(self, deals_data: List[Dict]):
-        """Обогащает данные из Google Sheets данными из CRM API для полей address, complex, contract_price, area"""
+        """Обогащает данные из Google Sheets данными из CRM API для полей address, complex, contract_price, area, rooms_count"""
         if not deals_data:
             return
         
@@ -670,6 +675,12 @@ class SheetsSyncManager:
                         if api_data.get('area') is not None:
                             try:
                                 deal['area'] = float(api_data['area'])
+                                updated = True
+                            except Exception:
+                                pass
+                        if api_data.get('rooms') is not None:
+                            try:
+                                deal['rooms_count'] = int(api_data['rooms'])
                                 updated = True
                             except Exception:
                                 pass
@@ -792,7 +803,7 @@ class SheetsSyncManager:
                     'date_signed','contract_number','mop','rop','dd',
                     'client_name','address','complex','contract_price','expires',
                     # добавляем вычисляемые поля, чтобы не было рассинхронизации
-                    'area','krisha_price','vitrina_price','score'
+                    'area','krisha_price','vitrina_price','score','rooms_count'
                 }
                 # Добавляем category только если она присутствует в property_data (т.е. была вычислена)
                 if 'category' in property_data:
@@ -849,7 +860,7 @@ class SheetsSyncManager:
                 present_keys = [k for k in rows[0].keys() if k not in excluded]
                 desired_order = [
                     'crm_id','date_signed','contract_number','mop','rop','dd','client_name','address','complex',
-                    'area','contract_price','expires','krisha_price','vitrina_price','score','category',
+                    'area','rooms_count','contract_price','expires','krisha_price','vitrina_price','score','category',
                     'collage','prof_collage','krisha','instagram','tiktok','mailing','stream','shows','analytics',
                     'price_update','provide_analytics','push_for_price','status'
                 ]
@@ -883,7 +894,7 @@ class SheetsSyncManager:
             else:
                 headers = [
                     'crm_id','date_signed','contract_number','mop','rop','dd','client_name','address','complex',
-                    'area','contract_price','expires','krisha_price','vitrina_price','score','category','collage','prof_collage','krisha','instagram','tiktok',
+                    'area','rooms_count','contract_price','expires','krisha_price','vitrina_price','score','category','collage','prof_collage','krisha','instagram','tiktok',
                     'mailing','stream','shows','analytics','price_update','provide_analytics','push_for_price','status'
                 ]
                 values = []

@@ -625,6 +625,21 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     message += f"🏢 ЖК: {contract.get('ЖК', 'N/A')}\n"
     message += f"💰 Цена: {contract.get('Цена указанная в договоре', 'N/A')}\n"
     
+    # Вычисляем альтернативную цену
+    krisha_price = contract.get('krisha_price')
+    vitrina_price = contract.get('vitrina_price')
+    if krisha_price is not None and vitrina_price is not None:
+        try:
+            # Преобразуем в числа, проверяя что это не пустые строки и не None
+            krisha_val = float(krisha_price) if krisha_price != '' and krisha_price is not None else None
+            vitrina_val = float(vitrina_price) if vitrina_price != '' and vitrina_price is not None else None
+            if krisha_val is not None and vitrina_val is not None and krisha_val > 0 and vitrina_val > 0:
+                alt_price = int((krisha_val + vitrina_val) / 2)
+                message += f"💱 Альтернативная цена: {alt_price}\n"
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Ошибка вычисления альтернативной цены для {crm_id}: {e}")
+            pass
+    
     message += f"⏰ Истекает: {format_date_ddmmyyyy(contract.get('Истекает'))}\n"
     # Показываем только последнюю цену (после последнего ";")
     price_update_val = contract.get('price_update', '')
@@ -638,6 +653,19 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     message += f"📌 Статус: {get_status_value(contract)}\n"
     category_val = contract.get('category', 'N/A')
     message += f"📂 Категория: {category_val}\n"
+    
+    # Добавляем рейтинг
+    score = contract.get('score')
+    if score is not None:
+        try:
+            # Проверяем что это не пустая строка
+            if score != '':
+                score_val = float(score)
+                # Форматируем с одним знаком после запятой
+                message += f"⭐ Рейтинг: {score_val:.1f}\n"
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Ошибка преобразования рейтинга для {crm_id}: {e}")
+            pass
     message += f"👁️ Показы: {contract.get('shows', 0)}\n\n"
 
     # Добавляем блок со ссылками, если есть
@@ -759,6 +787,8 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
         # Общие правила на коллаж/проф/показ
         if not contract.get('collage'):
             keyboard.append([InlineKeyboardButton("Создать коллаж", callback_data=f"collage_build_{crm_id}")])
+        else:
+            keyboard.append([InlineKeyboardButton("Переделать коллаж", callback_data=f"collage_build_{crm_id}")])
         if contract.get('collage') and not contract.get('prof_collage'):
             keyboard.append([InlineKeyboardButton("Проф коллаж", callback_data=f"action_pro_collage_{crm_id}")])
         keyboard.append([InlineKeyboardButton("Показ +1", callback_data=f"action_show_{crm_id}")])

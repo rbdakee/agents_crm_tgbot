@@ -624,8 +624,17 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
     message += f"🏠 Адрес: {contract.get('Адрес', 'N/A')}\n"
     message += f"🏢 ЖК: {contract.get('ЖК', 'N/A')}\n"
     message += f"💰 Цена: {contract.get('Цена указанная в договоре', 'N/A')}\n"
+    
     message += f"⏰ Истекает: {format_date_ddmmyyyy(contract.get('Истекает'))}\n"
-    message += f"📊 Корректировка цены: {contract.get('price_update', 'N/A')}\n"
+    # Показываем только последнюю цену (после последнего ";")
+    price_update_val = contract.get('price_update', '')
+    if price_update_val:
+        # Разделяем по ";" и берем последнее значение
+        price_parts = price_update_val.split(';')
+        last_price = price_parts[-1].strip() if price_parts else price_update_val.strip()
+        message += f"📊 Корректировка цены: {last_price}\n"
+    else:
+        message += f"📊 Корректировка цены: N/A\n"
     message += f"📌 Статус: {get_status_value(contract)}\n"
     category_val = contract.get('category', 'N/A')
     message += f"📂 Категория: {category_val}\n"
@@ -758,9 +767,8 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
             # Кнопки для статуса "Корректировка цены"
             if not value_is_filled(contract.get('push_for_price')):
                 keyboard.append([InlineKeyboardButton("Дожим", callback_data=f"push_{crm_id}")])
-            price_update_val = contract.get('price_update')
-            if not value_is_filled(price_update_val):
-                keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
+            # Кнопка "Обновление цены" всегда показывается при статусе "Корректировка цены"
+            keyboard.append([InlineKeyboardButton("Обновление цены", callback_data=f"price_adjust_{crm_id}")])
             keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
             keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
         elif analytics_mode_active:
@@ -3460,6 +3468,14 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
     crm_id = state.replace('waiting_price_', '')
     
     try:
+        # Проверяем, что в тексте нет точки с запятой
+        if ';' in text:
+            await update.message.reply_text(
+                "❌ Неверный формат цены. Нельзя использовать символ ';'.\n\n"
+                "Пример: 25000000 или 25 000 000"
+            )
+            return
+        
         # Очищаем цену от пробелов и форматируем
         price_clean = text.replace(' ', '').replace(',', '').replace('.', '')
         
@@ -3471,23 +3487,39 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
             return
         
-        # Обновляем цену в базе данных
+        # Получаем текущее значение цены из базы данных
         db_manager = await get_db_manager()
-        success = await db_manager.update_contract(crm_id, {'price_update': text})
+        agent_name = context.user_data.get('agent_name')
+        if not agent_name:
+            await update.message.reply_text("❌ Ошибка: агент не найден в сессии")
+            return
+        
+        contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
+        if not contract:
+            await update.message.reply_text("❌ Контракт не найден")
+            return
+        
+        # Получаем текущее значение price_update
+        current_price_update = contract.get('price_update', '')
+        
+        # Если уже есть цена, добавляем новую через ";"
+        if value_is_filled(current_price_update):
+            new_price_update = f"{current_price_update}; {text}"
+        else:
+            new_price_update = text
+        
+        # Обновляем цену в базе данных
+        success = await db_manager.update_contract(crm_id, {'price_update': new_price_update})
         
         if success:
             await update.message.reply_text(f"✅ Цена для контракта {crm_id} обновлена: {text}")
             
             # Возвращаемся к деталям контракта
-            agent_name = context.user_data.get('agent_name')
-            if agent_name:
-                contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
-                if contract:
-                    await show_contract_detail_by_contract(update, context, contract)
-                else:
-                    await update.message.reply_text("❌ Контракт не найден")
+            contract = await db_manager.search_contract_by_crm_id(crm_id, agent_name)
+            if contract:
+                await show_contract_detail_by_contract(update, context, contract)
             else:
-                await update.message.reply_text("❌ Ошибка: агент не найден в сессии")
+                await update.message.reply_text("❌ Контракт не найден")
         else:
             await update.message.reply_text("❌ Ошибка при обновлении цены")
             

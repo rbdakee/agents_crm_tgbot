@@ -331,21 +331,21 @@ class APIClient:
         
         # Проверяем, что complex_data является словарем
         if complex_data and isinstance(complex_data, dict):
-            complex_name = complex_data.get('houseName', 'Неизвестный ЖК')
+            complex_name = complex_data.get('houseName', '')
         else:
-            complex_name = 'Неизвестный ЖК'
+            complex_name = ''
         
         # Формируем адрес с проверками
         if address_data and isinstance(address_data, dict):
             street_data = address_data.get('street')
             if street_data and isinstance(street_data, dict):
-                street_name = street_data.get('nameRu', 'Неизвестная улица')
+                street_name = street_data.get('nameRu', '')
             else:
-                street_name = 'Неизвестная улица'
+                street_name = ''
             
             building = address_data.get('building', '')
         else:
-            street_name = 'Неизвестная улица'
+            street_name = ''
             building = ''
         
         address = f"{street_name} дом {building}" if building else street_name

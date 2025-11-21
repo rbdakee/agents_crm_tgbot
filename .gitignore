@@ -71,3 +71,6 @@ credentials.json
 
 # Docker
 .dockerignore
+
+# Local .py files
+find_duplicates.py

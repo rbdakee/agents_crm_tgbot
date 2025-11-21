@@ -69,12 +69,12 @@ COLLAGE_TEMPLATE = """
       transform: rotate(-25deg);  
       transform-origin: center;
       pointer-events: none;
-      z-index: 9999;                
+      z-index: 50;                
     }
 
     /* ===== HERO ===== */
-    .hero { position: relative; height: 560px; }
-    .hero img { width: 100%; height: 560px; object-fit: cover; display: block; }
+    .hero { position: relative; height: 560px; z-index: 100; }
+    .hero img { width: 100%; height: 560px; object-fit: cover; display: block; z-index: 100; }
     .rooms-chip {
       --chipH: 108px;
       --chipGap: 8px;
@@ -230,6 +230,8 @@ COLLAGE_TEMPLATE = """
       gap: 14px;
     }
     .photos img {
+      position: relative;
+      z-index: 100;
       width:100%; height: 240px;
       object-fit: cover;
       border-radius: 14px;
@@ -280,7 +282,7 @@ COLLAGE_TEMPLATE = """
       <div class="info-footer">
         <div class="footer-left">
         <div class="brand"><img src="${logo}" alt="logo"/></div>
-          <div class="footer-title"><div class="label">ЖК <span>${complex_name}</span></div></div>
+          ${complex_label}
           <div class="address"><img class="loc" src="${icon_location}" alt="loc"/>   ${address}</div>
           <div class="features">
             <ul class="benefits-list">  ${benefits}</ul>
@@ -334,7 +336,10 @@ def _build_html(ci: CollageInput) -> str:
         crm_id=ci.crm_id,
         rooms=html_escape.escape(ci.rooms or '-'),
         price=ci.price or '-',
-        complex_name=html_escape.escape(ci.complex_name or '-'),
+        complex_label=(
+            f'<div class="footer-title"><div class="label"><span>{html_escape.escape(ci.complex_name)}</span></div></div>'
+            if ci.complex_name else ''
+        ),
         address=html_escape.escape(ci.address or '-'),
         area_sqm=html_escape.escape(ci.area_sqm or '-'),
         floor=html_escape.escape(ci.floor or '-'),

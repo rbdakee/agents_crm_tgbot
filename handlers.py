@@ -3358,7 +3358,7 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     
     # Формируем сообщение с данными
     message = f"✅ Данные для коллажа:\n\n"
-    message += f"🏢 ЖК: {collage_input.complex_name}\n"
+    message += f"🏢 Название ЖК/Объекта: {collage_input.complex_name}\n"
     message += f"📍 Адрес: {collage_input.address}\n"
     message += f"📐 Площадь: {collage_input.area_sqm} м²\n"
     message += f"🏠 Комнат: {collage_input.rooms}\n"
@@ -3378,7 +3378,7 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     # Создаем кнопки для редактирования
     keyboard = [
         [
-            InlineKeyboardButton("🏢 ЖК", callback_data=f"edit_collage_complex_{crm_id}"),
+            InlineKeyboardButton("🏢 Название", callback_data=f"edit_collage_complex_{crm_id}"),
             InlineKeyboardButton("📍 Адрес", callback_data=f"edit_collage_address_{crm_id}")
         ],
         [

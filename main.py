@@ -3,16 +3,20 @@ import sys
 import signal
 import asyncio
 import os
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from telegram.ext import Application, CommandHandler
 
 from config import (
     BOT_TOKEN, USE_WEBHOOK, WEBHOOK_URL, WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH, LOG_LEVEL,
-    DATABASE_URL, SYNC_ENABLED, SYNC_INTERVAL_MINUTES
+    DATABASE_URL, SYNC_ENABLED, SYNC_INTERVAL_MINUTES, AUTO_TASKS_TIME
 )
-from handlers import setup_handlers, db_stats, manual_sync, manual_sync_with_cats
+from handlers import setup_handlers, db_stats, manual_sync, manual_sync_with_cats, run_recall_notifications_task
 from health import start_health_server
 from database_postgres import init_db_manager, get_db_manager
 from sheets_sync import init_sync_manager, get_sync_manager
+from services.rbd_service import fetch_new_objects
+from services.archive_service import archive_missing_objects
 
 # Настройка логирования для продакшена
 def setup_logging():
@@ -40,6 +44,63 @@ def signal_handler(signum, frame):
     logging.info(f"Получен сигнал {signum}, завершаем работу...")
     sys.exit(0)
 
+async def run_auto_tasks_scheduler(application: Application):
+    """Фоновая задача для автоматического запуска get_new_objects и archive в заданное время"""
+    almaty_tz = ZoneInfo("Asia/Almaty")
+    
+    # Парсим время из конфига (формат HH:MM)
+    try:
+        hour, minute = map(int, AUTO_TASKS_TIME.split(':'))
+        target_time = time(hour, minute)
+    except (ValueError, AttributeError) as e:
+        logging.error(f"Неверный формат времени AUTO_TASKS_TIME: {AUTO_TASKS_TIME}. Используется дефолт 02:00")
+        target_time = time(2, 0)
+    
+    last_run_date = None
+    
+    while True:
+        try:
+            now_almaty = datetime.now(almaty_tz)
+            current_time = now_almaty.time()
+            current_date = now_almaty.date()
+            
+            # Проверяем, наступило ли время запуска и не запускали ли мы уже сегодня
+            if (current_time.hour == target_time.hour and 
+                current_time.minute == target_time.minute and
+                last_run_date != current_date):
+                
+                logging.info(f"Запуск автоматических задач в {AUTO_TASKS_TIME}")
+                last_run_date = current_date
+                
+                # Запускаем задачи асинхронно, не блокируя основной поток
+                async def run_tasks():
+                    try:
+                        # Запускаем get_new_objects
+                        logging.info("Запуск автоматического get_new_objects...")
+                        stats = await fetch_new_objects()
+                        logging.info(f"Автоматический get_new_objects завершен: {stats}")
+                        
+                        # Запускаем archive
+                        logging.info("Запуск автоматического archive...")
+                        archive_stats = await archive_missing_objects()
+                        logging.info(f"Автоматический archive завершен: {archive_stats}")
+                        
+                    except Exception as e:
+                        logging.error(f"Ошибка при выполнении автоматических задач: {e}", exc_info=True)
+                
+                # Запускаем задачи в фоне
+                asyncio.create_task(run_tasks())
+            
+            # Проверяем каждую минуту
+            await asyncio.sleep(60)
+            
+        except asyncio.CancelledError:
+            logging.info("Автоматические задачи остановлены")
+            break
+        except Exception as e:
+            logging.error(f"Ошибка в планировщике автоматических задач: {e}", exc_info=True)
+            await asyncio.sleep(60)  # Продолжаем работу даже при ошибке
+
 async def main():
     setup_logging()
     
@@ -58,6 +119,12 @@ async def main():
         try:
             db_manager = await get_db_manager()
             await db_manager.ensure_schema_with_backup()
+            await db_manager.ensure_parsed_properties_schema()
+            # Применяем оптимизации индексов
+            try:
+                await db_manager.apply_database_optimizations()
+            except Exception as e:
+                logging.warning(f"Не удалось применить оптимизации БД (возможно, уже применены): {e}")
         except Exception as e:
             logging.error(f"Ошибка авто-миграции схемы с бэкапом: {e}")
             raise
@@ -117,6 +184,14 @@ async def main():
             sync_task = asyncio.create_task(sync_manager.run_background_sync())
             logging.info(f"Запущена фоновая синхронизация каждые {SYNC_INTERVAL_MINUTES} минут")
 
+        # Запускаем фоновую задачу для проверки уведомлений о перезвоне
+        recall_notifications_task = asyncio.create_task(run_recall_notifications_task(application))
+        logging.info("Запущена фоновая задача проверки уведомлений о перезвоне")
+        
+        # Запускаем фоновую задачу для автоматических задач (get_new_objects и archive)
+        auto_tasks_task = asyncio.create_task(run_auto_tasks_scheduler(application))
+        logging.info(f"Запущена фоновая задача автоматических задач (время запуска: {AUTO_TASKS_TIME})")
+
         if USE_WEBHOOK and WEBHOOK_URL:
             logging.info(f"Бот запущен в режиме вебхука на {WEBAPP_HOST}:{WEBAPP_PORT}")
             # Единый async-путь запуска (без blocking run_webhook). Используем updater.start_webhook
@@ -164,6 +239,10 @@ async def main():
         # Очистка ресурсов
         if sync_task:
             sync_task.cancel()
+        if 'recall_notifications_task' in locals():
+            recall_notifications_task.cancel()
+        if 'auto_tasks_task' in locals():
+            auto_tasks_task.cancel()
         try:
             db_manager = await get_db_manager()
             await db_manager.close()

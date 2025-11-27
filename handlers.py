@@ -1,11 +1,19 @@
-import logging
-import asyncio
-import os
-import re
-import html
-from typing import Dict, List
+import logging, asyncio, os, re, html
+from typing import Dict, List, Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from database_postgres import get_db_manager
+from api_client import get_collage_data_from_api, CollageInput, APIClient
+from collage import render_collage_to_image
+from services.rbd_service import fetch_new_objects
+from services.archive_service import archive_missing_objects
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,17 +23,21 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import BOT_USERNAME, CONTRACTS_PER_PAGE
-from database_postgres import get_db_manager
-from api_client import get_collage_data_from_api, CollageInput, APIClient
-from collage import render_collage_to_image
-from sqlalchemy import text
+from config import (
+    BOT_USERNAME, 
+    CONTRACTS_PER_PAGE,
+    AUTHORIZED_USER_ID,
+    PARSED_OBJECTS_PER_PAGE,
+    MOPS_PER_PAGE,
+    ROPS_PER_PAGE,
+    DD_ALLOWED,
+    PHONE_TO_DD_NAME,
+    SUPPORT_URL,
+    RECALL_CHECK_INTERVAL_SECONDS,
+    BULK_ASSIGN_COUNT,
+)
 
 logger = logging.getLogger(__name__)
-
-"""
-Удалена устаревшая версия clean_client_name; используется расширенная ниже.
-"""
 
 # User-scoped state structures
 user_states: Dict[int, str] = {}
@@ -36,6 +48,112 @@ user_search_results: Dict[int, List[Dict]] = {}
 user_current_search_page: Dict[int, int] = {}
 user_last_messages: Dict[int, object] = {}
 user_pending_downloads: Dict[int, int] = {}
+phone_to_chat_id: Dict[str, int] = {}
+
+NON_REALIZED_STATUSES = ['Не позвонили', 'Перезвонить', 'Встреча']
+REALIZED_STATUSES = ['Договор', 'Отказ', 'Архив']
+
+SUPPORT_INLINE_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Написать в поддержку", url=SUPPORT_URL)]
+])
+
+HELP_TEXT = (
+    "Часто задаваемые вопросы и инструкции:\n\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/3\">Как авторизоваться?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/7\">Как найти определенный объект?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/6\">Как сделать «Поиск по имени клиента»?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/8\">Как создать коллаж?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/9\">Как увеличить кол-во показов объекта?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/10\">Как добавить ссылку в объекте?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/11\">Как сохранить создание «Проф коллажа»?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/14\">Как найти все объекты РОП-у?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/15\">Как найти подопечного МОП-а и его объекты?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/16\">Как сменить категорию объекта?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/17\">Как сделать поиск по подопечным МОП-ам?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/18\">Как поменять роль аккаунта? (ДД/РОП/МОП)</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/19\">Как найти объекты РОП-а для роли ДД?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/20\">Как найти подопечных МОП-ов РОП-а для роли ДД?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/21\">Как сделать поиск по имени РОП-а для роли ДД?</a>\n"
+    "• <a href=\"https://t.me/vitrinaagentbot_instructions/23\">Как работать со статусами, что такое Аналитика и как обновить цену объекта?</a>\n\n"
+    "Проблемы с ботом? Напишите в поддержку!"
+)
+
+
+async def send_help_message(message):
+    if not message:
+        return
+    await message.reply_text(
+        HELP_TEXT,
+        reply_markup=SUPPORT_INLINE_KEYBOARD,
+        disable_web_page_preview=True,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_help_message(update.message)
+
+
+async def run_get_new_objects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if user.id != AUTHORIZED_USER_ID:
+        await update.message.reply_text("Команда доступна только авторизованному пользователю.")
+        return
+    await update.message.reply_text("🚀 Запускаю парсинг новых объектов... Результаты пришлю позже.")
+
+    async def worker():
+        notice = None
+        try:
+            notice = await context.bot.send_message(chat_id=update.effective_chat.id, text="⌛ Парсинг выполняется...")
+            stats = await fetch_new_objects()
+            text = (
+                "✅ Парсинг завершён.\n\n"
+                f"Обработано страниц: {stats.get('pages')}\n"
+                f"Добавлено новых объектов: {stats.get('inserted')}\n"
+                f"Дубликатов: {stats.get('duplicates')}\n"
+                f"Остановлено по порогу: {'Да' if stats.get('stopped') else 'Нет'}"
+            )
+            await notice.edit_text(text)
+        except Exception as e:
+            logger.error("Ошибка при парсинге объектов: %s", e, exc_info=True)
+            if notice:
+                await notice.edit_text(f"❌ Ошибка при парсинге: {e}")
+            else:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Ошибка при парсинге: {e}")
+
+    asyncio.create_task(worker())
+
+
+async def run_archive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if user.id != AUTHORIZED_USER_ID:
+        await update.message.reply_text("Команда доступна только авторизованному пользователю.")
+        return
+    await update.message.reply_text("🗂 Проверяю актуальность объявлений... Результаты пришлю позже.")
+
+    async def worker():
+        notice = None
+        try:
+            notice = await context.bot.send_message(chat_id=update.effective_chat.id, text="⌛ Проверка объявлений...")
+            stats = await archive_missing_objects()
+            text = (
+                "✅ Проверка завершена.\n\n"
+                f"Проверено объектов: {stats.get('checked')}\n"
+                f"Переведено в архив: {stats.get('archived')}"
+            )
+            await notice.edit_text(text)
+        except Exception as e:
+            logger.error("Ошибка проверки архивов: %s", e, exc_info=True)
+            if notice:
+                await notice.edit_text(f"❌ Ошибка проверки: {e}")
+            else:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Ошибка проверки: {e}")
+
+    asyncio.create_task(worker())
 
 
 # Role constants and helpers
@@ -49,17 +167,6 @@ def set_user_role(context: ContextTypes.DEFAULT_TYPE, role: str) -> None:
 def get_user_role(context: ContextTypes.DEFAULT_TYPE) -> str:
     return context.user_data.get('role')
 
-DD_ALLOWED: Dict[str, str] = {
-    # Имя: телефон (10 цифр)
-    'Мирасхан': '7055471077',
-    'Рустам': '7752152555',
-    'Айжан': '7058155000',
-    'Айнамкоз': '7477777719',
-    'Бегзат': '7757511212',
-}
-
-# Обратное отображение: телефон (10 цифр) -> имя ДД
-PHONE_TO_DD_NAME: Dict[str, str] = {v: k for k, v in DD_ALLOWED.items()}
 
 def _normalize_to_10_digits(phone: str) -> str:
     digits = ''.join(c for c in (phone or '') if c.isdigit())
@@ -94,10 +201,13 @@ def build_main_menu_keyboard_by_role(context: ContextTypes.DEFAULT_TYPE) -> Inli
         keyboard.append([InlineKeyboardButton("Мои РОП-ы", callback_data="my_rops")])
         keyboard.append([InlineKeyboardButton("Мои МОП-ы", callback_data="my_mops")])
     keyboard.append([InlineKeyboardButton("Мои объекты", callback_data="my_contracts")])
+    if role == ROLE_MOP:
+        keyboard.append([InlineKeyboardButton("Новые объекты", callback_data="new_objects")])
     if role in {ROLE_ROP, ROLE_DD}:
         keyboard.append([InlineKeyboardButton("Поиск", callback_data="search")])
     else:
         keyboard.append([InlineKeyboardButton("Поиск по имени клиента", callback_data="search_client")])
+    # keyboard.append([InlineKeyboardButton("Написать в поддержку", url="https://t.me/rbdakee")])
     keyboard.append([InlineKeyboardButton("Поменять роль", callback_data="change_role")])
     keyboard.append([InlineKeyboardButton("🚪 Выйти", callback_data="logout_confirm")])
     return InlineKeyboardMarkup(keyboard)
@@ -370,7 +480,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text(
                 "Добро пожаловать!\n\n"
-                "Введите номер телефона:"
+                "Введите номер телефона. Нужна помощь — используйте /help.",
             )
         return
 
@@ -394,7 +504,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = 'waiting_phone'
         await update.message.reply_text(
             "Добро пожаловать!\n\n"
-            "Введите номер телефона:"
+            "Введите номер телефона. Нужна помощь — используйте /help.",
         )
 
 
@@ -404,7 +514,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         "Вы вышли из системы.\n\n"
-        "Для входа введите команду /start"
+        "Для входа введите команду /start. Нужна помощь — /help.",
     )
 
 
@@ -845,7 +955,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отвечаем на callback query сразу
     await query.answer()
 
-    if data == "my_contracts":
+    if data == "main_menu":
+        role = get_user_role(context)
+        agent_name = context.user_data.get('agent_name', 'Агент')
+        agent_phone = context.user_data.get('phone') or ''
+        header = f"{role}: {agent_name}" if role else agent_name
+        reply_markup = build_main_menu_keyboard_by_role(context)
+        await query.edit_message_text(
+            f"{header}\nНомер: {agent_phone}\n\nВыберите действие:",
+            reply_markup=reply_markup
+        )
+
+    elif data == "my_contracts":
         # Очищаем информацию о возврате к списку МОП-а при переходе к общему списку
         context.user_data.pop('back_to_mop_list', None)
         await my_contracts(update, context)
@@ -1002,6 +1123,80 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
         await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
 
+    elif data == "new_objects":
+        await show_new_objects_menu(update, context)
+    
+    elif data == "my_new_objects":
+        await show_my_objects_menu(update, context)
+    
+    elif data.startswith("my_objects_filter_"):
+        filter_type = data.replace("my_objects_filter_", "")
+        context.user_data['parsed_object_source'] = 'my_new_objects'
+        await show_my_objects_list(update, context, filter_type=filter_type, page=1)
+    
+    elif data == "add_bulk_objects":
+        await handle_add_bulk_objects(update, context)
+    
+    elif data == "find_objects":
+        await show_find_objects(update, context, page=1)
+    
+    elif data.startswith("find_objects_page_"):
+        page = int(data.replace("find_objects_page_", ""))
+        await show_find_objects(update, context, page=page)
+    
+    elif data.startswith("parsed_object_"):
+        vitrina_id = int(data.replace("parsed_object_", ""))
+        context.user_data['parsed_object_source'] = 'my_new_objects'
+        await show_parsed_object_detail(update, context, vitrina_id)
+    
+    elif data.startswith("my_objects_page_"):
+        # Формат: my_objects_page_{page}|{filter_type} или my_objects_page_{page} (для обратной совместимости)
+        page_str = data.replace("my_objects_page_", "")
+        if "|" in page_str:
+            # Новый формат с фильтром
+            parts = page_str.split("|", 1)
+            page = int(parts[0])
+            filter_type = parts[1] if len(parts) > 1 and parts[1] else None
+        else:
+            # Старый формат или формат без фильтра
+            try:
+                page = int(page_str)
+                filter_type = context.user_data.get('my_objects_filter')
+            except ValueError:
+                filter_type = None
+                page = 1
+        
+        await show_my_objects_list(update, context, filter_type=filter_type, page=page)
+    
+    elif data.startswith("change_status_"):
+        vitrina_id = int(data.replace("change_status_", ""))
+        await show_status_selection(update, context, vitrina_id)
+    
+    elif data.startswith("status_"):
+        # Формат: status_Договор_123 или status_Перезвонить_123
+        parts = data.split("_")
+        if len(parts) >= 3:
+            status = parts[1]  # Договор, Встреча, Перезвонить, Не позвонили, Отказ, Архив
+            vitrina_id = int(parts[2])
+            await handle_status_selection(update, context, vitrina_id, status)
+    
+    elif data.startswith("cancel_recall_"):
+        # Отмена установки статуса "Перезвонить" - возвращаемся к карточке объекта
+        vitrina_id = int(data.replace("cancel_recall_", ""))
+        user_id = update.effective_user.id
+        user_states[user_id] = 'authenticated'  # Сбрасываем состояние ожидания
+        context.user_data.pop('pending_status_vitrina_id', None)  # Удаляем сохраненный ID
+        await show_parsed_object_detail(update, context, vitrina_id)
+    
+    elif data.startswith("add_comment_"):
+        vitrina_id = int(data.replace("add_comment_", ""))
+        user_id = update.effective_user.id
+        user_states[user_id] = f'waiting_comment_{vitrina_id}'
+        context.user_data['pending_comment_vitrina_id'] = vitrina_id
+        await query.edit_message_text(
+            "💬 Введите комментарий к объекту:"
+        )
+    
     elif data == "search_client":
         # Поиск по имени клиента
         user_id = update.effective_user.id
@@ -1210,8 +1405,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_total = await db_manager.count_pending_tasks_for_owner(owner_name, owner_role)
         message += f"Невыполненных заданий всего: {pending_total}\n\n"
         
-        # Пагинация: по 10 МОП-ов на страницу
-        mops_per_page = 10
+        # Пагинация: по MOPS_PER_PAGE МОП-ов на страницу
+        mops_per_page = MOPS_PER_PAGE
         total_count = len(mops)
         start_idx = (page - 1) * mops_per_page
         end_idx = start_idx + mops_per_page
@@ -1291,8 +1486,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_total = await db_manager.count_pending_tasks_for_owner(owner_name, ROLE_DD)
         message += f"Невыполненных заданий всего: {pending_total}\n\n"
         
-        # Пагинация: по 10 РОП-ов на страницу
-        rops_per_page = 10
+        # Пагинация: по ROPS_PER_PAGE РОП-ов на страницу
+        rops_per_page = ROPS_PER_PAGE
         total_count = len(rops)
         start_idx = (page - 1) * rops_per_page
         end_idx = start_idx + rops_per_page
@@ -1445,8 +1640,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"{category_label}:\n\nОбъекты не найдены", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         
-        # Пагинация: по 10 объектов на страницу
-        contracts_per_page = 10
+        # Пагинация: по CONTRACTS_PER_PAGE объектов на страницу
+        contracts_per_page = CONTRACTS_PER_PAGE
         total_count = len(contracts)
         start_idx = (page - 1) * contracts_per_page
         end_idx = start_idx + contracts_per_page
@@ -1557,8 +1752,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_total = await db_manager.count_pending_tasks_for_owner(rop_name, ROLE_ROP)
         message += f"Невыполненных заданий всего: {pending_total}\n\n"
         
-        # Пагинация: по 10 МОП-ов на страницу
-        mops_per_page = 10
+        # Пагинация: по MOPS_PER_PAGE МОП-ов на страницу
+        mops_per_page = MOPS_PER_PAGE
         total_count = len(mops)
         start_idx = (page - 1) * mops_per_page
         end_idx = start_idx + mops_per_page
@@ -1775,7 +1970,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             # Пагинация: по 10 объектов на страницу
-            contracts_per_page = 10
+            contracts_per_page = CONTRACTS_PER_PAGE
             total_count = len(contracts)
             start_idx = (page - 1) * contracts_per_page
             end_idx = start_idx + contracts_per_page
@@ -1881,7 +2076,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             # Пагинация: по 10 объектов на страницу
-            contracts_per_page = 10
+            contracts_per_page = CONTRACTS_PER_PAGE
             total_count = len(contracts)
             start_idx = (page - 1) * contracts_per_page
             end_idx = start_idx + contracts_per_page
@@ -1974,8 +2169,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"{category_label}\n\nОбъекты не найдены", reply_markup=InlineKeyboardMarkup(keyboard))
             return
         
-        # Пагинация: по 10 объектов на страницу
-        contracts_per_page = 10
+        # Пагинация: по CONTRACTS_PER_PAGE объектов на страницу
+        contracts_per_page = CONTRACTS_PER_PAGE
         total_count = len(contracts_filtered)
         start_idx = (page - 1) * contracts_per_page
         end_idx = start_idx + contracts_per_page
@@ -2931,6 +3126,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     state = user_states.get(user_id, '')
+    incoming_text = (update.message.text or "").strip()
+
+    if incoming_text.lower() == "помощь":
+        await send_help_message(update.message)
+        return
     
     if state == 'waiting_phone':
         await handle_phone(update, context)
@@ -2946,13 +3146,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_link_input(update, context)
     elif state.startswith('editing_collage_'):
         # Обработка редактирования полей коллажа
-        text = update.message.text
-        await handle_collage_field_edit(update, context, text, state)
+        await handle_collage_field_edit(update, context, incoming_text, state)
     # Удален текстовый поток waiting_collage_photos_ (используется callback-поток)
     elif state.startswith('waiting_price_'):
         # Обработка ввода новой цены
-        text = update.message.text
-        await handle_price_input(update, context, text, state)
+        await handle_price_input(update, context, incoming_text, state)
+    elif state.startswith('waiting_recall_time_'):
+        # Обработка ввода времени перезвона
+        await handle_recall_time_input(update, context, incoming_text, state)
+    elif state.startswith('waiting_comment_'):
+        # Обработка ввода комментария
+        await handle_comment_input(update, context, incoming_text, state)
     else:
         # Игнорируем неизвестные сообщения
         pass
@@ -2968,11 +3172,14 @@ async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(digits) == 11 and (digits.startswith('7') or digits.startswith('8')):
         digits = digits[1:]
     if len(digits) != 10:
-        await update.message.reply_text("❌ Ошибка при валидации номера телефона")
+        await update.message.reply_text(
+            "❌ Ошибка при валидации номера телефона.\n"
+            "Введите номер ещё раз или используйте /help.",
+        )
         return
     context.user_data['login_username'] = digits
     user_states[user_id] = 'waiting_password'
-    await update.message.reply_text("Введите пароль:")
+    await update.message.reply_text("Введите пароль. Нужна помощь — /help.")
 
 
 async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2983,7 +3190,9 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = context.user_data.get('login_username')
     if not username:
         user_states[user_id] = 'waiting_phone'
-        await update.message.reply_text("Введите номер телефона:")
+        await update.message.reply_text(
+            "Введите номер телефона. Нужна помощь — используйте /help.",
+        )
         return
     loading_msg = await update.message.reply_text("Идет авторизация...")
     async with APIClient() as api:
@@ -2994,9 +3203,14 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     agent_name = f"{(profile.get('surname') or '').strip()} {(profile.get('name') or '').strip()}".strip()
     context.user_data['agent_name'] = agent_name
-    context.user_data['phone'] = profile.get('phone')
+    phone = profile.get('phone')
+    context.user_data['phone'] = phone
     context.user_data['auth_token'] = profile.get('token')
     user_states[user_id] = 'authenticated'
+    
+    # Сохраняем связь телефон -> chat_id для уведомлений
+    if phone:
+        phone_to_chat_id[phone] = user_id
 
     # После логина — выбор роли
     pending_crm_id = context.user_data.get('pending_crm_id')
@@ -3145,6 +3359,130 @@ async def handle_mop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[user_id] = 'authenticated'
 
 
+async def handle_recall_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE, incoming_text: str, state: str):
+    """Обработка ввода времени перезвона в формате ДД.ММ.ГГГГ ЧЧ:ММ"""
+    user_id = update.effective_user.id
+    
+    # Извлекаем vitrina_id из state (waiting_recall_time_123)
+    try:
+        vitrina_id = int(state.replace('waiting_recall_time_', ''))
+    except ValueError:
+        await update.message.reply_text("❌ Ошибка: неверный формат запроса")
+        user_states[user_id] = 'authenticated'
+        return
+    
+    # Парсим время в формате ДД.ММ.ГГГГ ЧЧ:ММ
+    pattern = r'^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})$'
+    match = re.match(pattern, incoming_text.strip())
+    
+    if not match:
+        await update.message.reply_text(
+            "❌ Неверный формат времени.\n\n"
+            "Введите время в формате: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+            "Например: 01.01.2025 18:00"
+        )
+        return
+    
+    try:
+        day, month, year, hour, minute = map(int, match.groups())
+        
+        # Проверяем корректность даты и времени
+        almaty_tz = ZoneInfo("Asia/Almaty")
+        recall_datetime = datetime(year, month, day, hour, minute, tzinfo=almaty_tz)
+        
+        # Проверяем, что время не в прошлом
+        now_almaty = datetime.now(almaty_tz)
+        if recall_datetime <= now_almaty:
+            await update.message.reply_text(
+                "❌ Время перезвона должно быть в будущем.\n"
+                "Введите время еще раз:"
+            )
+            return
+        
+        # Обновляем статус и время перезвона в БД
+        db_manager = await get_db_manager()
+        success = await db_manager.update_parsed_property_status(
+            vitrina_id, 
+            "Перезвонить", 
+            recall_time=recall_datetime
+        )
+        
+        if success:
+            user_states[user_id] = 'authenticated'
+            await update.message.reply_text(
+                f"✅ Статус изменен на 'Перезвонить'\n"
+                f"⏰ Время перезвона: {recall_datetime.strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Вы получите уведомление в указанное время.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data="my_objects_filter_non_realized")]
+                ])
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Ошибка при обновлении статуса. Попробуйте еще раз."
+            )
+    
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Ошибка: неверная дата или время.\n"
+            f"Введите время в формате: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+            f"Например: 01.01.2025 18:00"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при обработке времени перезвона: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Произошла ошибка при обработке времени. Попробуйте еще раз."
+        )
+
+
+async def handle_comment_input(update: Update, context: ContextTypes.DEFAULT_TYPE, incoming_text: str, state: str):
+    """Обработка ввода комментария к объекту"""
+    user_id = update.effective_user.id
+    
+    # Извлекаем vitrina_id из state (waiting_comment_123)
+    try:
+        vitrina_id = int(state.replace('waiting_comment_', ''))
+    except ValueError:
+        await update.message.reply_text("❌ Ошибка: неверный формат запроса")
+        user_states[user_id] = 'authenticated'
+        return
+    
+    comment = incoming_text.strip()
+    
+    # Проверяем, что комментарий не пустой
+    if not comment:
+        await update.message.reply_text(
+            "❌ Комментарий не может быть пустым.\n"
+            "Введите комментарий еще раз:"
+        )
+        return
+    
+    # Проверяем, что в комментарии нет ';'
+    if ';' in comment:
+        await update.message.reply_text(
+            "❌ Комментарий не может содержать символ ';'.\n"
+            "Введите комментарий еще раз:"
+        )
+        return
+    
+    # Добавляем комментарий в БД
+    db_manager = await get_db_manager()
+    success = await db_manager.add_parsed_property_comment(vitrina_id, comment)
+    
+    if success:
+        user_states[user_id] = 'authenticated'
+        await update.message.reply_text(
+            "✅ Комментарий успешно добавлен!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К объекту", callback_data=f"parsed_object_{vitrina_id}")]
+            ])
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Ошибка при добавлении комментария. Попробуйте еще раз."
+        )
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фотографий"""
     user_id = update.effective_user.id
@@ -3285,9 +3623,7 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from sheets_sync import get_sync_manager
         
         # Проверяем, что команду вызвал авторизованный пользователь @rbdakee
-        authorized_user_id = 893220231  # User ID для @rbdakee
-        
-        if update.effective_user.id != authorized_user_id:
+        if update.effective_user.id != AUTHORIZED_USER_ID:
             await update.message.reply_text("❌ У вас нет прав для выполнения полной синхронизации")
             logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить полную синхронизацию")
             return
@@ -3322,9 +3658,7 @@ async def manual_sync_with_cats(update: Update, context: ContextTypes.DEFAULT_TY
         from sheets_sync import get_sync_manager
         
         # Проверяем, что команду вызвал авторизованный пользователь @rbdakee
-        authorized_user_id = 893220231  # User ID для @rbdakee
-        
-        if update.effective_user.id != authorized_user_id:
+        if update.effective_user.id != AUTHORIZED_USER_ID:
             await update.message.reply_text("❌ У вас нет прав для выполнения полной синхронизации")
             logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить полную синхронизацию с категориями")
             return
@@ -3558,9 +3892,600 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("❌ Ошибка при обновлении цены")
 
 
+# Новые объекты для МОП
+async def show_new_objects_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления новыми объектами"""
+    query = update.callback_query
+    if query:
+        await show_loading(query)
+    else:
+        query = update.message
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    stats = await db_manager.get_my_objects_status_stats(agent_phone)
+    non_realized_total = (
+        stats.get('not_called', 0) +
+        stats.get('recall', 0) +
+        stats.get('meeting', 0)
+    )
+    realized_total = (
+        stats.get('deal', 0) +
+        stats.get('rejected', 0) +
+        stats.get('archived', 0)
+    )
+    
+    text = (
+        "🆕 Новые объекты\n\n"
+        f"Всего объектов: {stats.get('total', 0)}\n"
+        f"⏳ Не реализовано: {non_realized_total}\n"
+        f"✅ Реализовано: {realized_total}\n\n"
+        "Выберите действие:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 Все объекты", callback_data="my_objects_filter_all")],
+        [InlineKeyboardButton("⏳ Не реализованное", callback_data="my_objects_filter_non_realized")],
+        [InlineKeyboardButton("✅ Реализованное", callback_data="my_objects_filter_realized")],
+        [InlineKeyboardButton("➕ Добавить 10 объектов", callback_data="add_bulk_objects")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    ]
+    
+    if hasattr(query, 'edit_message_text'):
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_find_objects(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    """Показывает список объектов для поиска с пагинацией"""
+    query = update.callback_query
+    await show_loading(query)
+    
+    db_manager = await get_db_manager()
+    objects, total_count = await db_manager.get_latest_parsed_properties(page=page, page_size=PARSED_OBJECTS_PER_PAGE)
+    
+    if not objects:
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="new_objects")]]
+        await query.edit_message_text("Нет доступных объектов", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    # Сохраняем объекты для пагинации
+    user_id = update.effective_user.id
+    context.user_data['find_objects_page'] = page
+    context.user_data['find_objects_total'] = total_count
+    
+    text = "📋 Доступные объекты:\n\n"
+    
+    for obj in objects:
+        vitrina_id = obj.get('vitrina_id')
+        object_type = obj.get('object_type') or 'N/A'
+        address = obj.get('address') or 'N/A'
+        complex_name = obj.get('complex') or 'N/A'
+        year_built = obj.get('year_built') or ''
+        property_class = obj.get('property_class') or 'N/A'
+        room_count = obj.get('room_count') or 'N/A'
+        area = obj.get('area') or 'N/A'
+        floor_num = obj.get('floor_num') or 'N/A'
+        floor_count = obj.get('floor_count') or 'N/A'
+        sell_price = obj.get('sell_price') or 0
+        
+        text += f"Объект ID: {vitrina_id}\n"
+        text += f"📍 Адрес: {address}\n"
+        text += f"🏢 ЖК: {complex_name}"
+        if year_built:
+            text += f" | {year_built}"
+        text += f"\n⭐ Класс: {property_class}\n"
+        text += f"🛏️ {room_count} | 📏 {area} | 🏢 Этаж {floor_num}/{floor_count}\n"
+        text += f"💰 Цена: {sell_price:,.0f}\n"
+        if obj.get('stats_agent_given'):
+            text += "Статус доступности: ❌ уже закреплён за другим агентом\n"
+        else:
+            text += "Статус доступности: ✅ свободен\n"
+        text += "-"*30 + "\n\n"
+    
+    # Пагинация
+    keyboard = []
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("◀️ Предыдущая", callback_data=f"find_objects_page_{page - 1}"))
+    if page * PARSED_OBJECTS_PER_PAGE < total_count:
+        nav_buttons.append(InlineKeyboardButton("Следующая ▶️", callback_data=f"find_objects_page_{page + 1}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="new_objects")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_add_bulk_objects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет агенту несколько последних свободных объектов"""
+    query = update.callback_query
+    await query.answer()
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    stats = await db_manager.get_my_objects_status_stats(agent_phone)
+    # Считаем только нереализованные объекты
+    non_realized_count = (
+        stats.get('not_called', 0) +
+        stats.get('recall', 0) +
+        stats.get('meeting', 0)
+    )
+    
+    if non_realized_count >= 15:
+        await query.edit_message_text(
+            "⚠️ У вас уже 15 или больше нереализованных объектов.\n"
+            "Сначала обработайте текущие объекты, чтобы взять новые.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data="new_objects")]
+            ])
+        )
+        return
+    
+    added_count, vitrina_ids, categories_dict = await db_manager.assign_latest_parsed_properties(
+        agent_phone,
+        limit=BULK_ASSIGN_COUNT
+    )
+    
+    if added_count == 0:
+        await query.edit_message_text(
+            "ℹ️ Нет свободных объектов для добавления.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data="new_objects")]
+            ])
+        )
+        return
+    
+    # Формируем сообщение с распределением по категориям
+    summary_parts = [f"✅ Добавлено объектов: {added_count}, категории:"]
+    
+    for category in ['A', 'B', 'C']:
+        ids_list = categories_dict.get(category, [])
+        if ids_list:
+            ids_str = ', '.join(str(vid) for vid in ids_list)
+            summary_parts.append(f"\n{category} ({len(ids_list)}): {ids_str}")
+    
+    summary = ''.join(summary_parts)
+    await query.message.reply_text(summary)
+    await show_new_objects_menu(update, context)
+
+
+async def show_my_objects_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню со статистикой объектов агента"""
+    query = update.callback_query
+    if query:
+        await show_loading(query)
+    else:
+        query = update.message
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    stats = await db_manager.get_my_objects_status_stats(agent_phone)
+    
+    # Вычисляем реализованные и нереализованные объекты
+    realized = stats.get('deal', 0) + stats.get('rejected', 0) + stats.get('archived', 0)
+    non_realized = stats.get('not_called', 0) + stats.get('recall', 0) + stats.get('meeting', 0)
+    total = stats.get('total', 0)
+    
+    text = "📋 Мои новые объекты\n\n"
+    text += f"Всего объектов: {total}\n\n"
+    text += f"⏳ Не реализовано: {non_realized}\n"
+    text += f"✅ Реализовано: {realized}\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 Все объекты", callback_data="my_objects_filter_all")],
+        [InlineKeyboardButton("⏳ Не реализовано", callback_data="my_objects_filter_non_realized")],
+        [InlineKeyboardButton("✅ Реализовано", callback_data="my_objects_filter_realized")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    ]
+    
+    if query and hasattr(query, 'edit_message_text'):
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_my_objects_list(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE, 
+    filter_type: Optional[str] = None,
+    page: int = 1
+):
+    """Показывает отфильтрованный список объектов агента"""
+    query = update.callback_query
+    await show_loading(query)
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    
+    # Определяем название фильтра для заголовка
+    filter_names = {
+        None: "Все объекты",
+        "all": "Все объекты",
+        "Не позвонили": "Не позвонили",
+        "Перезвонить": "Перезвонить",
+        "Встреча": "Встреча",
+        "Договор": "Договор",
+        "Отказ": "Отказ",
+        "Архив": "Архив",
+        "non_realized": "Не реализованное",
+        "realized": "Реализованное",
+    }
+    filter_name = filter_names.get(filter_type, "Все объекты")
+    
+    # Получаем объекты с фильтром
+    if filter_type in (None, "all"):
+        status_filter = None
+    elif filter_type == "non_realized":
+        status_filter = NON_REALIZED_STATUSES
+    elif filter_type == "realized":
+        status_filter = REALIZED_STATUSES
+    else:
+        status_filter = filter_type
+    objects, total_count = await db_manager.get_my_new_parsed_properties(
+        agent_phone, 
+        page=page, 
+        page_size=PARSED_OBJECTS_PER_PAGE,
+        status_filter=status_filter
+    )
+    
+    if not objects:
+        keyboard = [
+            [InlineKeyboardButton("🔙 К меню", callback_data="my_new_objects")]
+        ]
+        await query.edit_message_text(
+            f"📋 {filter_name}\n\nНет объектов в этой категории",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    # Сохраняем для пагинации
+    context.user_data['my_objects_page'] = page
+    context.user_data['my_objects_total'] = total_count
+    context.user_data['my_objects_filter'] = filter_type
+    
+    text = f"📋 {filter_name}\n\n"
+    keyboard = []
+    
+    for obj in objects:
+        vitrina_id = obj.get('vitrina_id')
+        object_type = obj.get('object_type') or 'N/A'
+        address = obj.get('address') or 'N/A'
+        complex_name = obj.get('complex') or 'N/A'
+        year_built = obj.get('year_built') or ''
+        property_class = obj.get('property_class') or 'N/A'
+        room_count = obj.get('room_count') or 'N/A'
+        area = obj.get('area') or 'N/A'
+        floor_num = obj.get('floor_num') or 'N/A'
+        floor_count = obj.get('floor_count') or 'N/A'
+        sell_price = obj.get('sell_price') or 0
+        
+        text += f"Объект ID: {vitrina_id}\n"
+        text += f"📍 Адрес: {address}\n"
+        text += f"🏢 ЖК: {complex_name}"
+        if year_built:
+            text += f" | {year_built}"
+        text += f"\n⭐ Класс: {property_class}\n"
+        text += f"🛏️ {room_count} | 📏 {area} | 🏢 Этаж {floor_num}/{floor_count}\n"
+        text += f"💰 Цена: {sell_price:,.0f}\n\n"
+        
+        # Добавляем категорию
+        category = obj.get('stats_object_category')
+        if category:
+            category_emoji = {'A': '🟢', 'B': '🟡', 'C': '🔴'}.get(category, '📌')
+            text += f"{category_emoji} Категория: {category}\n"
+        
+        # Добавляем статус
+        status = obj.get('stats_object_status')
+        text += f"Статус: {format_status_with_emoji(status)}\n"
+        
+        # Если статус "Перезвонить", добавляем время перезвона
+        if status == 'Перезвонить' and obj.get('stats_recall_time'):
+            recall_time = obj.get('stats_recall_time')
+            try:
+                # Обрабатываем datetime объект
+                if isinstance(recall_time, datetime):
+                    almaty_tz = ZoneInfo("Asia/Almaty")
+                    if recall_time.tzinfo:
+                        recall_time_almaty = recall_time.astimezone(almaty_tz)
+                    else:
+                        recall_time_almaty = recall_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(almaty_tz)
+                    text += f"⏰ Время для перезвона: {recall_time_almaty.strftime('%d.%m.%Y %H:%M')}\n"
+            except Exception as e:
+                logger.error(f"Ошибка форматирования времени перезвона: {e}", exc_info=True)
+        
+        text += "-"*30+"\n\n"
+        
+        keyboard.append([InlineKeyboardButton(f"Объект ID: {vitrina_id}", callback_data=f"parsed_object_{vitrina_id}")])
+    
+    # Пагинация
+    nav_buttons = []
+    # Используем разделитель | для фильтра, чтобы избежать проблем с подчеркиваниями
+    filter_suffix = f"|{filter_type}" if filter_type and filter_type != "all" else ""
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("◀️ Предыдущая", callback_data=f"my_objects_page_{page - 1}{filter_suffix}"))
+    if page * PARSED_OBJECTS_PER_PAGE < total_count:
+        nav_buttons.append(InlineKeyboardButton("Следующая ▶️", callback_data=f"my_objects_page_{page + 1}{filter_suffix}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton("🔙 К меню", callback_data="new_objects")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+def format_status_with_emoji(status: Optional[str]) -> str:
+    """Форматирует статус с эмодзи"""
+    if not status:
+        return 'Не установлен'
+    status_map = {
+        'Не позвонили': '📞 Не позвонили',
+        'Перезвонить': '📞 Перезвонить',
+        'Встреча': '🤝 Встреча',
+        'Переговоры': '🤝 Встреча',
+        'Договор': '✅ Договор',
+        'Принял': '✅ Договор',
+        'Отказ': '❌ Отказ',
+        'Архив': '📦 Архив',
+    }
+    return status_map.get(status, status)
+
+
+async def show_parsed_object_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, vitrina_id: int):
+    """Показывает детальную карточку объекта"""
+    query = update.callback_query
+    await show_loading(query)
+    
+    db_manager = await get_db_manager()
+    obj = await db_manager.get_parsed_property_by_vitrina_id(vitrina_id)
+    
+    if not obj:
+        await query.edit_message_text("❌ Объект не найден")
+        return
+    
+    text = f"Объект ID: {obj.get('vitrina_id')}\n"
+    text += f"📍 Адрес: {obj.get('address') or 'N/A'}\n"
+    text += f"🏢 ЖК: {obj.get('complex') or 'N/A'}"
+    if obj.get('year_built'):
+        text += f" | {obj.get('year_built')}"
+    text += f"\n🏗️ Застройщик: {obj.get('builder') or 'N/A'}\n"
+    text += f"⭐ Класс: {obj.get('property_class') or 'N/A'}\n"
+    text += f"💊 Тип/Состояние: {obj.get('flat_type') or 'N/A'} | {obj.get('condition') or 'N/A'}\n"
+    text += f"↕️ Высота потолков: {obj.get('ceiling_height') or 'N/A'}\n"
+    text += f"🧱 Стены: {obj.get('wall_type') or 'N/A'}\n\n"
+
+    text += f"🛏️ {obj.get('room_count') or 'N/A'} | 📏 {obj.get('area') or 'N/A'} | 🏢 Этаж {obj.get('floor_num') or 'N/A'}/{obj.get('floor_count') or 'N/A'}\n"
+    text += f"💰 Цена: {obj.get('sell_price') or 0:,.0f}\n"
+    text += f"💰 Цена за м²: {obj.get('sell_price_per_m2') or 0:,.0f}\n\n"
+    
+    description = obj.get('description') or 'N/A'
+    if len(description) > 500:
+        description = description[:500] + "..."
+    text += f"Описание: {description}\n\n"
+    
+    # Добавляем комментарии (разделенные по ;)
+    comments = obj.get('stats_description')
+    if comments:
+        # Разделяем комментарии по ; и каждую часть выводим с новой строки
+        comments_parts = [c.strip() for c in str(comments).split(';') if c.strip()]
+        if comments_parts:
+            text += "💬 Комментарии:\n"
+            for comment_part in comments_parts:
+                text += f"{comment_part}\n"
+            text += "\n"
+
+    text += f"📞 Телефон: {obj.get('phones') or 'N/A'}\n"
+    
+    # Добавляем категорию
+    category = obj.get('stats_object_category')
+    if category:
+        text += f"📊 Категория: {category}\n"
+    
+    # Добавляем статус
+    status = obj.get('stats_object_status')
+    text += f"\nСтатус: {format_status_with_emoji(status)}\n"
+    
+    # Если статус "Перезвонить", добавляем время перезвона
+    if status == 'Перезвонить' and obj.get('stats_recall_time'):
+        recall_time = obj.get('stats_recall_time')
+        try:
+            # Обрабатываем datetime объект
+            if isinstance(recall_time, datetime):
+                almaty_tz = ZoneInfo("Asia/Almaty")
+                if recall_time.tzinfo:
+                    recall_time_almaty = recall_time.astimezone(almaty_tz)
+                else:
+                    recall_time_almaty = recall_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(almaty_tz)
+                text += f"⏰ Время для перезвона: {recall_time_almaty.strftime('%d.%m.%Y %H:%M')}\n"
+        except Exception as e:
+            logger.error(f"Ошибка форматирования времени перезвона: {e}", exc_info=True)
+    
+    krisha_id = obj.get('krisha_id')
+    if krisha_id:
+        text += f"🔗 Ссылка: https://krisha.kz/a/show/{krisha_id}"
+    
+    # Определяем, откуда пришли
+    source = context.user_data.get('parsed_object_source', 'my_new_objects')
+    if source == 'my_new_objects':
+        page = context.user_data.get('my_objects_page', 1)
+        filter_type = context.user_data.get('my_objects_filter')
+        if filter_type and filter_type != "all":
+            filter_suffix = f"|{filter_type}"
+            back_callback = f"my_objects_page_{page}{filter_suffix}" if page > 1 else f"my_objects_filter_{filter_type}"
+        else:
+            back_callback = f"my_objects_page_{page}" if page > 1 else "my_new_objects"
+    else:
+        page = context.user_data.get('find_objects_page', 1)
+        back_callback = f"find_objects_page_{page}" if page > 1 else "find_objects"
+    
+    # Сохраняем vitrina_id в контексте для возврата
+    context.user_data['current_parsed_object_id'] = vitrina_id
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Сменить статус", callback_data=f"change_status_{vitrina_id}")],
+        [InlineKeyboardButton("💬 Добавить комментарий", callback_data=f"add_comment_{vitrina_id}")],
+        [InlineKeyboardButton("🔙 Назад", callback_data=back_callback)]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_status_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, vitrina_id: int):
+    """Показывает меню выбора статуса"""
+    query = update.callback_query
+    await query.answer()
+    
+    text = "Выберите новый статус объекта:"
+    keyboard = [
+        [InlineKeyboardButton("📞 Не позвонили", callback_data=f"status_Не позвонили_{vitrina_id}")],
+        [InlineKeyboardButton("📞 Перезвонить", callback_data=f"status_Перезвонить_{vitrina_id}")],
+        [InlineKeyboardButton("🤝 Встреча", callback_data=f"status_Встреча_{vitrina_id}")],
+        [InlineKeyboardButton("✅ Договор", callback_data=f"status_Договор_{vitrina_id}")],
+        [InlineKeyboardButton("❌ Отказ", callback_data=f"status_Отказ_{vitrina_id}")],
+        [InlineKeyboardButton("📦 Архив", callback_data=f"status_Архив_{vitrina_id}")],
+        [InlineKeyboardButton("🔙 Назад", callback_data=f"parsed_object_{vitrina_id}")]
+    ]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_status_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, vitrina_id: int, status: str):
+    """Обрабатывает выбор статуса"""
+    query = update.callback_query
+    await query.answer()
+    
+    db_manager = await get_db_manager()
+    
+    if status == "Перезвонить":
+        # Запрашиваем время перезвона
+        user_id = update.effective_user.id
+        user_states[user_id] = f'waiting_recall_time_{vitrina_id}'
+        context.user_data['pending_status_vitrina_id'] = vitrina_id
+        
+        await query.edit_message_text(
+            "📞 Введите время для перезвона в формате:\n"
+            "01.01.2025 18:00\n\n"
+            "Формат: ДД.ММ.ГГГГ ЧЧ:ММ",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data=f"cancel_recall_{vitrina_id}")]
+            ])
+        )
+    else:
+        # Обновляем статус сразу
+        success = await db_manager.update_parsed_property_status(vitrina_id, status)
+        
+        if success:
+            # Определяем, к какому фильтру относится статус
+            if status in REALIZED_STATUSES:
+                filter_type = "realized"
+            else:
+                filter_type = "non_realized"
+            
+            await query.edit_message_text(
+                f"✅ Статус объекта изменен на: {status}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data=f"my_objects_filter_{filter_type}")]
+                ])
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Ошибка при обновлении статуса",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 К объекту", callback_data=f"parsed_object_{vitrina_id}")]
+                ])
+            )
+
+
+async def check_and_send_recall_notifications(application: Application):
+    """Проверяет объекты с временем перезвона и отправляет уведомления"""
+    try:
+        db_manager = await get_db_manager()
+        objects_to_notify = await db_manager.get_parsed_properties_for_recall_notification()
+        
+        if not objects_to_notify:
+            return
+        
+        for obj in objects_to_notify:
+            agent_phone = obj.get('agent_phone')
+            vitrina_id = obj.get('vitrina_id')
+            address = obj.get('address') or 'N/A'
+            krisha_id = obj.get('krisha_id')
+            
+            # Получаем chat_id по номеру телефона
+            chat_id = phone_to_chat_id.get(agent_phone)
+            
+            if chat_id:
+                try:
+                    message_text = (
+                        f"⏰ Напоминание о перезвоне\n\n"
+                        f"Объект ID: {vitrina_id}\n"
+                        f"📍 Адрес: {address}\n"
+                    )
+                    if krisha_id:
+                        message_text += f"🔗 Ссылка: https://krisha.kz/a/show/{krisha_id}\n"
+                    
+                    message_text += "\nНе забудьте перезвонить клиенту!"
+                    
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=message_text,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 К объекту", callback_data=f"parsed_object_{vitrina_id}")]
+                        ])
+                    )
+                    
+                    # Помечаем, что уведомление отправлено (очищаем stats_recall_time)
+                    await db_manager.mark_recall_notification_sent(vitrina_id)
+                    logger.info(f"Отправлено уведомление о перезвоне для объекта {vitrina_id} агенту {agent_phone}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления для объекта {vitrina_id}: {e}", exc_info=True)
+            else:
+                logger.warning(f"Не найден chat_id для телефона {agent_phone}, объект {vitrina_id}")
+                # Все равно помечаем как отправленное, чтобы не спамить
+                await db_manager.mark_recall_notification_sent(vitrina_id)
+    
+    except Exception as e:
+        logger.error(f"Ошибка при проверке уведомлений о перезвоне: {e}", exc_info=True)
+
+
+async def run_recall_notifications_task(application: Application):
+    """Фоновая задача для периодической проверки уведомлений о перезвоне"""
+    while True:
+        try:
+            await check_and_send_recall_notifications(application)
+            # Проверяем каждую минуту
+            await asyncio.sleep(RECALL_CHECK_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("Задача проверки уведомлений о перезвоне отменена")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в задаче проверки уведомлений: {e}", exc_info=True)
+            await asyncio.sleep(RECALL_CHECK_INTERVAL_SECONDS)
+
+
 def setup_handlers(application: Application):
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("logout", logout))
+    application.add_handler(CommandHandler("get_new_objects", run_get_new_objects))
+    application.add_handler(CommandHandler("archive", run_archive_check))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -3568,13 +4493,12 @@ def setup_handlers(application: Application):
 
 async def automate_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Автоматически пересчитывает и обновляет категории для всех объектов.
-    Доступно только пользователю с authorized_user_id = 893220231 и по команде /automate_categories.
+    Доступно только пользователю с AUTHORIZED_USER_ID и по команде /automate_categories.
     Берёт значения roof (B), score (C), window (D) из третьего листа ("Лист8"),
     площадь (area) из API, contract_price из SQL, затем рассчитывает category и обновляет SQL.
     """
     try:
-        authorized_user_id = 893220231
-        if update.effective_user.id != authorized_user_id:
+        if update.effective_user.id != AUTHORIZED_USER_ID:
             await update.message.reply_text("❌ У вас нет прав для автоматического обновления категорий")
             logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить automate_categories")
             return
@@ -3591,11 +4515,10 @@ async def automate_categories(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def automate_categories_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пересчитывает категории только для объектов с пустой category.
-    Доступно только пользователю с authorized_user_id = 893220231 и по команде /automate_categories_2.
+    Доступно только пользователю с AUTHORIZED_USER_ID и по команде /automate_categories_2.
     """
     try:
-        authorized_user_id = 893220231
-        if update.effective_user.id != authorized_user_id:
+        if update.effective_user.id != AUTHORIZED_USER_ID:
             await update.message.reply_text("❌ У вас нет прав для автоматического обновления категорий")
             logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить automate_categories_2")
             return
@@ -3612,11 +4535,10 @@ async def automate_categories_2(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def automate_categories_c(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Заполняет категорией 'С' все пустые значения category.
-    Доступно только пользователю с authorized_user_id = 893220231 и по команде /automate_categories_c.
+    Доступно только пользователю с AUTHORIZED_USER_ID и по команде /automate_categories_c.
     """
     try:
-        authorized_user_id = 893220231
-        if update.effective_user.id != authorized_user_id:
+        if update.effective_user.id != AUTHORIZED_USER_ID:
             await update.message.reply_text("❌ У вас нет прав для массового заполнения категорий")
             logger.warning(f"Пользователь {update.effective_user.username} (ID: {update.effective_user.id}) попытался выполнить automate_categories_c")
             return
@@ -3626,6 +4548,3 @@ async def automate_categories_c(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Ошибка automate_categories_c: {e}")
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
-
-# Тестовый хендлер удалён по требованию

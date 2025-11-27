@@ -6,15 +6,13 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, date, time as dtime
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 import gspread
 from google.oauth2.service_account import Credentials
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
-import json
 from api_client import APIClient
 from config import CRM_API_ENRICHMENT
 

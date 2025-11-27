@@ -1,22 +1,19 @@
-"""
-Модуль для работы с PostgreSQL базой данных
-Заменяет старую систему кеширования на прямую работу с БД
-"""
-
-import logging
+import logging, gspread, os
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
-from sqlalchemy import text, func, and_, or_, select, update, Table, Column, String, Integer, BigInteger, Boolean, Date, DateTime, MetaData, Float
+from sqlalchemy import text, func, and_, or_, select, update, Table, Column, String, Integer, BigInteger, Boolean, Date, DateTime, MetaData, Float, Text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
-import os
-import gspread
 from google.oauth2.service_account import Credentials
-from config import SHEET_ID, THIRD_SHEET_GID
+from config import SHEET_ID, THIRD_SHEET_GID, DB_BATCH_SIZE, DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_RECYCLE
 from api_client import APIClient
 
 logger = logging.getLogger(__name__)
+
+def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
+    for idx in range(0, len(items), size):
+        yield items[idx:idx + size]
 
 # SQLAlchemy Core table definition (safe subset covering used columns)
 metadata = MetaData()
@@ -57,6 +54,42 @@ properties = Table(
     Column("created_at", DateTime),
 )
 
+parsed_properties_table = Table(
+    "parsed_properties", metadata,
+    Column("vitrina_id", BigInteger, primary_key=True, autoincrement=True),
+    Column("rbd_id", BigInteger, unique=True, nullable=False),
+    Column("krisha_id", String(64)),
+    Column("krisha_date", DateTime(timezone=True)),
+    Column("object_type", String(255)),
+    Column("address", Text),
+    Column("complex", String(255)),
+    Column("builder", String(255)),
+    Column("flat_type", String(255)),
+    Column("property_class", String(255)),
+    Column("condition", String(255)),
+    Column("sell_price", Float),
+    Column("sell_price_per_m2", Float),
+    Column("address_type", String(255)),
+    Column("house_num", String(255)),
+    Column("floor_num", Integer),
+    Column("floor_count", Integer),
+    Column("room_count", Integer),
+    Column("phones", String(255)),
+    Column("description", Text),
+    Column("ceiling_height", Float),
+    Column("area", Float),
+    Column("year_built", Integer),
+    Column("wall_type", String(255)),
+    Column("stats_agent_given", String(255)),
+    Column("stats_time_given", DateTime(timezone=True)),
+    Column("stats_object_status", String(255)),
+    Column("stats_recall_time", DateTime(timezone=True)),
+    Column("stats_description", Text),
+    Column("stats_object_category", String(10)),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()),
+)
+
 ACTIVE_STATUS_FILTER = or_(
     properties.c.status.is_(None),
     func.lower(properties.c.status) != 'реализовано'
@@ -68,6 +101,9 @@ class PostgreSQLManager:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._init_database()
+        self._third_map_cache: Optional[Dict[str, Dict[str, Optional[float]]]] = None
+        self._third_map_cache_time: Optional[datetime] = None
+        self._third_map_cache_ttl = 3600  # Кеш на 1 час
     
     def _init_database(self):
         """Инициализация подключения к PostgreSQL"""
@@ -77,9 +113,9 @@ class PostgreSQLManager:
                 self.database_url,
                 echo=False,
                 pool_pre_ping=True,
-                pool_recycle=3600,
-                pool_size=10,
-                max_overflow=20
+                pool_recycle=DB_POOL_RECYCLE,
+                pool_size=DB_POOL_SIZE,
+                max_overflow=DB_MAX_OVERFLOW
             )
             
             # Создаем фабрику сессий
@@ -94,6 +130,36 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"Ошибка инициализации PostgreSQL: {e}")
             raise
+
+    async def apply_database_optimizations(self) -> None:
+        """Применяет оптимизации индексов для улучшения производительности БД"""
+        try:
+            async with self.async_session() as session:
+                # Читаем SQL файл с оптимизациями
+                optimization_file = os.path.join(os.path.dirname(__file__), 'database_optimization.sql')
+                
+                if os.path.exists(optimization_file):
+                    with open(optimization_file, 'r', encoding='utf-8') as f:
+                        sql_content = f.read()
+                    
+                    # Выполняем SQL команды (разделяем по ;)
+                    statements = [s.strip() for s in sql_content.split(';') if s.strip() and not s.strip().startswith('--')]
+                    
+                    for statement in statements:
+                        if statement:
+                            try:
+                                await session.execute(text(statement))
+                            except Exception as e:
+                                # Игнорируем ошибки "already exists" для индексов
+                                if 'already exists' not in str(e).lower():
+                                    logger.warning(f"Ошибка при применении оптимизации: {e}")
+                    
+                    await session.commit()
+                    logger.info("Оптимизации БД успешно применены")
+                else:
+                    logger.warning(f"Файл оптимизации не найден: {optimization_file}")
+        except Exception as e:
+            logger.error(f"Ошибка применения оптимизаций БД: {e}", exc_info=True)
 
     async def ensure_schema_with_backup(self) -> None:
         """Проверяет наличие новых колонок (area, krisha_price, vitrina_price, score, rooms_count).
@@ -152,6 +218,34 @@ class PostgreSQLManager:
                 logger.info("ALTER TABLE выполнены, схема обновлена")
         except Exception as e:
             logger.error(f"Ошибка ensure_schema_with_backup: {e}")
+    
+    async def ensure_parsed_properties_schema(self) -> None:
+        """Проверяет наличие колонки stats_object_category в parsed_properties.
+        Если отсутствует — добавляет её. Операция идемпотентная и безопасная.
+        """
+        try:
+            async with self.async_session() as session:
+                # Проверяем наличие колонки
+                col_check = await session.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'parsed_properties'
+                      AND column_name = 'stats_object_category'
+                """))
+                exists = col_check.fetchone() is not None
+                
+                if exists:
+                    logger.info("Колонка stats_object_category уже существует в parsed_properties")
+                    return
+                
+                logger.info("Добавляю колонку stats_object_category в parsed_properties...")
+                await session.execute(text("""
+                    ALTER TABLE parsed_properties 
+                    ADD COLUMN IF NOT EXISTS stats_object_category VARCHAR(10)
+                """))
+                await session.commit()
+                logger.info("Колонка stats_object_category успешно добавлена в parsed_properties")
+        except Exception as e:
+            logger.error(f"Ошибка ensure_parsed_properties_schema: {e}", exc_info=True)
     
     async def get_agent_contracts_page(self, agent_name: str, page: int = 1, page_size: int = 10, role: Optional[str] = None) -> Tuple[List[Dict], int]:
         """Получает страницу контрактов агента с пагинацией"""
@@ -800,7 +894,7 @@ class PostgreSQLManager:
             async with APIClient() as api_client:
                 crm_ids = [str(r[0].get('crm_id')) for r in rows_prepared if r[0].get('crm_id')]
                 if crm_ids:
-                    crm_data = await api_client.get_crm_data_batch(crm_ids, batch_size=150)
+                    crm_data = await api_client.get_crm_data_batch(crm_ids, batch_size=DB_BATCH_SIZE)
                     for cid, data in crm_data.items():
                         area_val = data.get('area')
                         try:
@@ -1067,7 +1161,7 @@ class PostgreSQLManager:
                 # Площади для уже сопоставленных
                 crm_ids = [str(r[0].get('crm_id')) for r in rows_prepared if r[0].get('crm_id')]
                 if crm_ids:
-                    crm_data = await api_client.get_crm_data_batch(crm_ids, batch_size=150)
+                    crm_data = await api_client.get_crm_data_batch(crm_ids, batch_size=DB_BATCH_SIZE)
                     for cid, data in crm_data.items():
                         area_val = (data or {}).get('area')
                         try:
@@ -1743,6 +1837,895 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"Ошибка массового заполнения категории 'С': {e}")
             return {"updated": 0, "skipped": 0, "errors": 1}
+
+    async def get_parsed_properties_count(self) -> int:
+        """Получает общее количество объектов в таблице parsed_properties"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT COUNT(*) FROM parsed_properties
+                """))
+                return result.scalar() or 0
+        except Exception as e:
+            logger.error(f"Ошибка получения количества объектов в parsed_properties: {e}")
+            return 0
+
+    async def get_new_objects_count_by_phone(self) -> int:
+        """Получает количество новых объектов(где stats_agent_given IS NULL и krisha_id IS NOT NULL)"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT COUNT(*) FROM parsed_properties
+                    WHERE stats_agent_given IS NULL
+                    AND krisha_id IS NOT NULL
+                    AND krisha_id != ''
+                """))
+                return result.scalar() or 0
+        except Exception as e:
+            logger.error(f"Ошибка получения количества новых объектов: {e}")
+            return 0
+
+    async def get_agent_objects_count_by_phone(self, phone: str) -> int:
+        """Получает количество объектов конкретного агента по номеру телефона (где stats_agent_given = phone и krisha_id IS NOT NULL)"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT COUNT(*) FROM parsed_properties
+                    WHERE stats_agent_given = :phone
+                    AND krisha_id IS NOT NULL
+                    AND krisha_id != ''
+                """), {"phone": phone})
+                return result.scalar() or 0
+        except Exception as e:
+            logger.error(f"Ошибка получения количества объектов агента: {e}")
+            return 0
+
+    async def get_recall_objects_count_by_phone(self, phone: str) -> int:
+        """Получает количество объектов с stats_recall_time для агента по номеру телефона"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT COUNT(*) FROM parsed_properties
+                    WHERE stats_recall_time IS NOT NULL
+                    AND krisha_id IS NOT NULL
+                    AND krisha_id != ''
+                """))
+                return result.scalar() or 0
+        except Exception as e:
+            logger.error(f"Ошибка получения количества объектов для перезвона: {e}")
+            return 0
+
+    async def get_latest_parsed_properties(self, page: int = 1, page_size: int = 10) -> Tuple[List[Dict], int]:
+        """Получает последние объекты из parsed_properties, отсортированные по krisha_date (только с krisha_id)"""
+        try:
+            offset = (page - 1) * page_size
+            async with self.async_session() as session:
+                # Подсчет общего количества (только не взятые объекты)
+                count_result = await session.execute(text("""
+                    SELECT COUNT(*) FROM parsed_properties
+                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                    AND stats_agent_given IS NULL
+                """))
+                total_count = count_result.scalar() or 0
+
+                # Получение страницы (только не взятые объекты)
+                result = await session.execute(text("""
+                    SELECT vitrina_id, rbd_id, krisha_id, krisha_date, object_type, address,
+                           complex, builder, flat_type, property_class, condition, sell_price,
+                           sell_price_per_m2, house_num, floor_num, floor_count, room_count,
+                           phones, description, ceiling_height, area, year_built, wall_type,
+                           stats_agent_given, stats_time_given, stats_object_status, stats_recall_time, stats_description
+                    FROM parsed_properties
+                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                    AND stats_agent_given IS NULL
+                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
+                    LIMIT :limit OFFSET :offset
+                """), {"limit": page_size, "offset": offset})
+                
+                objects = []
+                for row in result.fetchall():
+                    obj = {
+                        "vitrina_id": row.vitrina_id,
+                        "rbd_id": row.rbd_id,
+                        "krisha_id": row.krisha_id,
+                        "krisha_date": row.krisha_date,
+                        "object_type": row.object_type,
+                        "address": row.address,
+                        "complex": row.complex,
+                        "builder": row.builder,
+                        "flat_type": row.flat_type,
+                        "property_class": row.property_class,
+                        "condition": row.condition,
+                        "sell_price": row.sell_price,
+                        "sell_price_per_m2": row.sell_price_per_m2,
+                        "house_num": row.house_num,
+                        "floor_num": row.floor_num,
+                        "floor_count": row.floor_count,
+                        "room_count": row.room_count,
+                        "phones": row.phones,
+                        "description": row.description,
+                        "ceiling_height": row.ceiling_height,
+                        "area": row.area,
+                        "year_built": row.year_built,
+                        "wall_type": row.wall_type,
+                        "stats_agent_given": row.stats_agent_given,
+                        "stats_time_given": row.stats_time_given,
+                        "stats_object_status": row.stats_object_status,
+                        "stats_recall_time": row.stats_recall_time,
+                        "stats_description": row.stats_description,
+                    }
+                    objects.append(obj)
+                
+                return objects, total_count
+        except Exception as e:
+            logger.error(f"Ошибка получения последних объектов: {e}", exc_info=True)
+            return [], 0
+
+    async def get_parsed_property_by_vitrina_id(self, vitrina_id: int) -> Optional[Dict]:
+        """Получает объект по vitrina_id"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT vitrina_id, rbd_id, krisha_id, krisha_date, object_type, address,
+                           complex, builder, flat_type, property_class, condition, sell_price,
+                           sell_price_per_m2, house_num, floor_num, floor_count, room_count,
+                           phones, description, ceiling_height, area, year_built, wall_type,
+                           stats_agent_given, stats_time_given, stats_object_status, stats_recall_time, 
+                           stats_description, stats_object_category
+                    FROM parsed_properties
+                    WHERE vitrina_id = :vitrina_id
+                """), {"vitrina_id": vitrina_id})
+                
+                row = result.fetchone()
+                if not row:
+                    return None
+                
+                return {
+                    "vitrina_id": row.vitrina_id,
+                    "rbd_id": row.rbd_id,
+                    "krisha_id": row.krisha_id,
+                    "krisha_date": row.krisha_date,
+                    "object_type": row.object_type,
+                    "address": row.address,
+                    "complex": row.complex,
+                    "builder": row.builder,
+                    "flat_type": row.flat_type,
+                    "property_class": row.property_class,
+                    "condition": row.condition,
+                    "sell_price": row.sell_price,
+                    "sell_price_per_m2": row.sell_price_per_m2,
+                    "house_num": row.house_num,
+                    "floor_num": row.floor_num,
+                    "floor_count": row.floor_count,
+                    "room_count": row.room_count,
+                    "phones": row.phones,
+                    "description": row.description,
+                    "ceiling_height": row.ceiling_height,
+                    "area": row.area,
+                    "year_built": row.year_built,
+                    "wall_type": row.wall_type,
+                    "stats_agent_given": row.stats_agent_given,
+                    "stats_time_given": row.stats_time_given,
+                    "stats_object_status": row.stats_object_status,
+                    "stats_recall_time": row.stats_recall_time,
+                    "stats_description": row.stats_description,
+                    "stats_object_category": row.stats_object_category,
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения объекта по vitrina_id {vitrina_id}: {e}", exc_info=True)
+            return None
+
+    async def take_parsed_property(self, vitrina_id: int, agent_phone: str) -> bool:
+        """Берет объект: устанавливает stats_agent_given, stats_time_given, stats_object_status"""
+        try:
+            async with self.async_session() as session:
+                # Проверяем, не взят ли уже объект
+                check_result = await session.execute(text("""
+                    SELECT stats_agent_given FROM parsed_properties
+                    WHERE vitrina_id = :vitrina_id
+                """), {"vitrina_id": vitrina_id})
+                row = check_result.fetchone()
+                if row and row.stats_agent_given:
+                    return False  # Уже взят
+                
+                # Обновляем объект
+                await session.execute(text("""
+                    UPDATE parsed_properties
+                    SET stats_agent_given = :phone,
+                        stats_time_given = NOW() AT TIME ZONE 'Asia/Almaty',
+                        stats_object_status = 'Не позвонили',
+                        updated_at = NOW()
+                    WHERE vitrina_id = :vitrina_id
+                """), {"phone": agent_phone, "vitrina_id": vitrina_id})
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка взятия объекта {vitrina_id}: {e}", exc_info=True)
+            return False
+
+    async def assign_latest_parsed_properties(self, agent_phone: str, limit: int = 10) -> Tuple[int, List[int], Dict[str, List[int]]]:
+        """Назначает агенту несколько последних свободных объектов с распределением по категориям.
+        
+        Возвращает: (количество добавленных, список всех ID, словарь {категория: [id, ...]})
+        Распределение: 3-A, 3-B, 4-C. Если не хватает A, увеличивается B. Если не хватает B, увеличивается C.
+        """
+        try:
+            # Целевое распределение: 3-A, 3-B, 4-C
+            target_a = 3
+            target_b = 3
+            target_c = 4
+            
+            async with self.async_session() as session:
+                # Получаем объекты категории A
+                result_a = await session.execute(text("""
+                    SELECT vitrina_id, stats_object_category
+                    FROM parsed_properties
+                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                      AND stats_agent_given IS NULL
+                      AND stats_object_category = 'A'
+                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+                """), {"limit": target_a})
+                rows_a = result_a.fetchall()
+                ids_a = [row.vitrina_id for row in rows_a]
+                
+                # Вычисляем сколько нужно B (увеличиваем, если не хватило A, но не больше общего лимита)
+                missing_a = target_a - len(ids_a)
+                needed_b = min(limit - len(ids_a), target_b + missing_a)
+                needed_b = max(0, needed_b)  # Не может быть отрицательным
+                
+                # Получаем объекты категории B
+                result_b = await session.execute(text("""
+                    SELECT vitrina_id, stats_object_category
+                    FROM parsed_properties
+                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                      AND stats_agent_given IS NULL
+                      AND stats_object_category = 'B'
+                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+                """), {"limit": needed_b})
+                rows_b = result_b.fetchall()
+                ids_b = [row.vitrina_id for row in rows_b]
+                
+                # Вычисляем сколько нужно C (остальное до общего лимита)
+                needed_c = limit - len(ids_a) - len(ids_b)
+                needed_c = max(0, needed_c)  # Не может быть отрицательным
+                
+                # Получаем объекты категории C
+                result_c = await session.execute(text("""
+                    SELECT vitrina_id, stats_object_category
+                    FROM parsed_properties
+                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                      AND stats_agent_given IS NULL
+                      AND (stats_object_category = 'C' OR stats_object_category IS NULL)
+                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+                """), {"limit": needed_c})
+                rows_c = result_c.fetchall()
+                ids_c = [row.vitrina_id for row in rows_c]
+                
+                # Объединяем все ID
+                all_ids = ids_a + ids_b + ids_c
+                
+                if not all_ids:
+                    return 0, [], {}
+                
+                # Обновляем объекты
+                for vitrina_id in all_ids:
+                    await session.execute(text("""
+                        UPDATE parsed_properties
+                        SET stats_agent_given = :phone,
+                            stats_time_given = NOW() AT TIME ZONE 'Asia/Almaty',
+                            stats_object_status = 'Не позвонили',
+                            updated_at = NOW()
+                        WHERE vitrina_id = :vitrina_id
+                    """), {"phone": agent_phone, "vitrina_id": vitrina_id})
+                
+                await session.commit()
+                
+                # Формируем словарь по категориям
+                categories_dict = {
+                    'A': ids_a,
+                    'B': ids_b,
+                    'C': ids_c,
+                }
+                
+                return len(all_ids), all_ids, categories_dict
+        except Exception as e:
+            logger.error(f"Ошибка пакетного назначения объектов агенту {agent_phone}: {e}", exc_info=True)
+            return 0, [], {}
+
+    async def get_my_objects_status_stats(self, agent_phone: str) -> Dict[str, int]:
+        """Получает статистику по статусам объектов агента"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Не позвонили') as not_called,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Перезвонить') as recall,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Встреча') as meeting,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Договор') as deal,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Отказ') as rejected,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Архив') as archived
+                    FROM parsed_properties
+                    WHERE stats_agent_given = :phone
+                    AND krisha_id IS NOT NULL AND krisha_id != ''
+                """), {"phone": agent_phone})
+                
+                row = result.fetchone()
+                if row:
+                    return {
+                        "total": row.total or 0,
+                        "not_called": row.not_called or 0,
+                        "recall": row.recall or 0,
+                        "meeting": row.meeting or 0,
+                        "deal": row.deal or 0,
+                        "rejected": row.rejected or 0,
+                        "archived": row.archived or 0,
+                    }
+                return {"total": 0, "not_called": 0, "recall": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики по статусам: {e}", exc_info=True)
+            return {"total": 0, "not_called": 0, "recall": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
+
+    async def get_my_new_parsed_properties(
+        self, 
+        agent_phone: str, 
+        page: int = 1, 
+        page_size: int = 10,
+        status_filter: Optional[str] = None
+    ) -> Tuple[List[Dict], int]:
+        """Получает объекты агента по номеру телефона с опциональной фильтрацией по статусу"""
+        try:
+            offset = (page - 1) * page_size
+            async with self.async_session() as session:
+                # Базовое условие WHERE
+                where_clause = "WHERE stats_agent_given = :phone AND krisha_id IS NOT NULL AND krisha_id != ''"
+                params = {"phone": agent_phone}
+                
+                # Добавляем фильтр по статусу
+                if status_filter:
+                    if isinstance(status_filter, list):
+                        placeholders = []
+                        for idx, status_val in enumerate(status_filter):
+                            key = f"status_{idx}"
+                            placeholders.append(f":{key}")
+                            params[key] = status_val
+                        where_clause += f" AND stats_object_status IN ({', '.join(placeholders)})"
+                    else:
+                        where_clause += " AND stats_object_status = :status"
+                        params["status"] = status_filter
+                
+                # Подсчет общего количества
+                count_result = await session.execute(
+                    text(f"SELECT COUNT(*) FROM parsed_properties {where_clause}"),
+                    params
+                )
+                total_count = count_result.scalar() or 0
+
+                # Получение страницы
+                result = await session.execute(text(f"""
+                    SELECT vitrina_id, rbd_id, krisha_id, krisha_date, object_type, address,
+                           complex, builder, flat_type, property_class, condition, sell_price,
+                           sell_price_per_m2, house_num, floor_num, floor_count, room_count,
+                           phones, description, ceiling_height, area, year_built, wall_type,
+                           stats_agent_given, stats_time_given, stats_object_status, stats_recall_time, stats_description
+                    FROM parsed_properties
+                    {where_clause}
+                    ORDER BY stats_time_given DESC NULLS LAST, vitrina_id DESC
+                    LIMIT :limit OFFSET :offset
+                """), {**params, "limit": page_size, "offset": offset})
+                
+                objects = []
+                for row in result.fetchall():
+                    obj = {
+                        "vitrina_id": row.vitrina_id,
+                        "rbd_id": row.rbd_id,
+                        "krisha_id": row.krisha_id,
+                        "krisha_date": row.krisha_date,
+                        "object_type": row.object_type,
+                        "address": row.address,
+                        "complex": row.complex,
+                        "builder": row.builder,
+                        "flat_type": row.flat_type,
+                        "property_class": row.property_class,
+                        "condition": row.condition,
+                        "sell_price": row.sell_price,
+                        "sell_price_per_m2": row.sell_price_per_m2,
+                        "house_num": row.house_num,
+                        "floor_num": row.floor_num,
+                        "floor_count": row.floor_count,
+                        "room_count": row.room_count,
+                        "phones": row.phones,
+                        "description": row.description,
+                        "ceiling_height": row.ceiling_height,
+                        "area": row.area,
+                        "year_built": row.year_built,
+                        "wall_type": row.wall_type,
+                        "stats_agent_given": row.stats_agent_given,
+                        "stats_time_given": row.stats_time_given,
+                        "stats_object_status": row.stats_object_status,
+                        "stats_recall_time": row.stats_recall_time,
+                        "stats_description": row.stats_description,
+                    }
+                    objects.append(obj)
+                
+                return objects, total_count
+        except Exception as e:
+            logger.error(f"Ошибка получения объектов агента: {e}", exc_info=True)
+            return [], 0
+
+    async def _load_third_map(self) -> Dict[str, Dict[str, Optional[float]]]:
+        """Загружает third_map из Google Sheets с кешированием"""
+        from datetime import datetime, timedelta
+        
+        # Проверяем кеш
+        if (self._third_map_cache is not None and 
+            self._third_map_cache_time is not None and
+            (datetime.now() - self._third_map_cache_time).total_seconds() < self._third_map_cache_ttl):
+            return self._third_map_cache
+        
+        # Загружаем из Google Sheets
+        credentials_file = 'credentials.json'
+        if not os.path.exists(credentials_file):
+            logger.warning(f"Файл {credentials_file} не найден, категоризация будет упрощенной")
+            return {}
+        
+        if not SHEET_ID or not THIRD_SHEET_GID:
+            logger.warning("SHEET_ID или THIRD_SHEET_GID не установлены, категоризация будет упрощенной")
+            return {}
+        
+        try:
+            credentials = Credentials.from_service_account_file(
+                credentials_file,
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
+            gc = gspread.authorize(credentials)
+            spreadsheet = gc.open_by_key(SHEET_ID)
+            third_ws = spreadsheet.get_worksheet_by_id(int(THIRD_SHEET_GID))
+            
+            rows = third_ws.get_all_values()
+            if not rows:
+                return {}
+            
+            # Поиск строки заголовков
+            header_row_idx = 0
+            for i, r in enumerate(rows):
+                line = ' '.join(r).lower()
+                if ('жк' in line) or ('крыша' in line) or ('витрина' in line) or ('общий балл' in line):
+                    header_row_idx = i
+                    break
+            
+            def to_float_safe(v):
+                try:
+                    s = str(v).replace(' ', '').replace('\u00A0', '')
+                    s = s.replace(',', '.')
+                    if s.strip() == '':
+                        return None
+                    return float(s)
+                except Exception:
+                    return None
+            
+            def norm_complex(x: str) -> str:
+                import re
+                s = (x or '').lower()
+                for token in ['жк', 'жилой комплекс', 'residence', 'residential', 'complex']:
+                    s = s.replace(token, ' ')
+                for ch in ['"', '\'', '«', '»', '.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '/', '\\', '-', '–', '_']:
+                    s = s.replace(ch, ' ')
+                s = re.sub(r"\bблок\s+[a-zа-я0-9]+\b", " ", s)
+                s = re.sub(r"\bочередь\b", " ", s)
+                s = re.sub(r"\b(\d+)\s*\-\s*\d+\b", r"\1", s)
+                s = ' '.join(s.split())
+                synonyms = {
+                    'buqar': 'бухар', 'bukhar': 'бухар', 'buqarjyrau': 'бухаржырау', 'jyrau': 'жырау',
+                    'qalashyq': 'калашык', 'qalashy': 'калашык', 'qurylys': 'курылыс', 'exclusive': 'эксклюзив',
+                    'bukhar': 'бухар', 'jyray': 'жырау', 'dauletti': 'даулетти', 'qalashyk': 'калашык',
+                    'city': 'city', 'sat': 'sat'
+                }
+                tokens = s.split()
+                norm_tokens = []
+                for t in tokens:
+                    t_clean = synonyms.get(t, t)
+                    norm_tokens.append(t_clean)
+                return ' '.join(norm_tokens)
+            
+            complex_to_params: Dict[str, Dict[str, Optional[float]]] = {}
+            for i, r in enumerate(rows):
+                if i <= header_row_idx:
+                    continue
+                complex_name = (r[0] if len(r) > 0 else '').strip()
+                if not complex_name:
+                    continue
+                roof_raw = r[1] if len(r) > 1 else ''
+                score_raw = r[2] if len(r) > 2 else ''
+                window_raw = r[3] if len(r) > 3 else ''
+                complex_to_params[norm_complex(complex_name)] = {
+                    'roof': to_float_safe(roof_raw),
+                    'score': to_float_safe(score_raw),
+                    'window': to_float_safe(window_raw),
+                }
+            
+            # Сохраняем в кеш
+            self._third_map_cache = complex_to_params
+            self._third_map_cache_time = datetime.now()
+            logger.info(f"Загружен third_map: {len(complex_to_params)} записей")
+            return complex_to_params
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки third_map: {e}", exc_info=True)
+            return {}
+    
+    def _find_complex_in_map(self, complex_name: str, third_map: Dict[str, Dict[str, Optional[float]]]) -> Optional[Dict[str, Optional[float]]]:
+        """Находит параметры для ЖК в third_map с нормализацией и поиском по вариантам"""
+        if not complex_name or not third_map:
+            return None
+        
+        def norm_complex(x: str) -> str:
+            import re
+            s = (x or '').lower()
+            for token in ['жк', 'жилой комплекс', 'residence', 'residential', 'complex']:
+                s = s.replace(token, ' ')
+            for ch in ['"', '\'', '«', '»', '.', ',', ';', ':', '(', ')', '[', ']', '{', '}', '/', '\\', '-', '–', '_']:
+                s = s.replace(ch, ' ')
+            s = re.sub(r"\bблок\s+[a-zа-я0-9]+\b", " ", s)
+            s = re.sub(r"\bочередь\b", " ", s)
+            s = re.sub(r"\b(\d+)\s*\-\s*\d+\b", r"\1", s)
+            s = ' '.join(s.split())
+            synonyms = {
+                'buqar': 'бухар', 'bukhar': 'бухар', 'buqarjyrau': 'бухаржырау', 'jyrau': 'жырау',
+                'qalashyq': 'калашык', 'qalashy': 'калашык', 'qurylys': 'курылыс', 'exclusive': 'эксклюзив',
+                'bukhar': 'бухар', 'jyray': 'жырау', 'dauletti': 'даулетти', 'qalashyk': 'калашык',
+                'city': 'city', 'sat': 'sat'
+            }
+            tokens = s.split()
+            norm_tokens = []
+            for t in tokens:
+                t_clean = synonyms.get(t, t)
+                norm_tokens.append(t_clean)
+            return ' '.join(norm_tokens)
+        
+        def find_best_match(norm_name: str) -> Optional[str]:
+            name_set = set(norm_name.split())
+            if not name_set:
+                return None
+            best_key, best_score = None, 0.0
+            for k in third_map.keys():
+                k_set = set(k.split())
+                if not k_set:
+                    continue
+                inter = len(name_set & k_set)
+                union = len(name_set | k_set)
+                score = inter / union if union else 0.0
+                smaller, bigger = (name_set, k_set) if len(name_set) <= len(k_set) else (k_set, name_set)
+                if smaller and smaller.issubset(bigger):
+                    score = max(score, 0.999)
+                if score > best_score:
+                    best_score, best_key = score, k
+            return best_key if best_score >= 0.45 else None
+        
+        # Прямое совпадение
+        norm_key = norm_complex(complex_name)
+        if norm_key in third_map:
+            return third_map[norm_key]
+        
+        # Поиск по вариантам
+        best = find_best_match(norm_key)
+        if best and best in third_map:
+            return third_map[best]
+        
+        return None
+
+    async def _calculate_category_for_parsed(self, item: Dict[str, Any]) -> str:
+        """Вычисляет категорию для parsed_property используя полную формулу из automate_categories.
+        
+        Использует sell_price как contract_price, area для расчета window_price и roof_price.
+        Загружает third_map из Google Sheets для получения roof, window, score.
+        Если данных недостаточно, возвращает 'C'.
+        """
+        def is_num(x) -> bool:
+            return isinstance(x, (int, float)) and x is not None
+        
+        def assign_category(contract_price: Optional[float], window_price: Optional[float], 
+                           roof_price: Optional[float], score: Optional[float]) -> str:
+            score_is_num = is_num(score)
+            if score_is_num:
+                if all(is_num(x) for x in [contract_price, window_price, roof_price]):
+                    if (window_price <= contract_price <= roof_price) and (score > 8):
+                        return 'A'
+                    elif ((contract_price < window_price) or (contract_price > roof_price)) or (5 <= score <= 8):
+                        return 'B'
+                    elif (contract_price > roof_price) and (score < 5):
+                        return 'C'
+            else:
+                if all(is_num(x) for x in [contract_price, window_price, roof_price]):
+                    if (window_price <= contract_price <= roof_price):
+                        return 'B'
+                if (window_price is None) or (roof_price is None):
+                    if is_num(score) and (score > 8):
+                        return 'A'
+                    elif is_num(score) and (5 <= score <= 8):
+                        return 'B'
+            return 'C'
+        
+        sell_price = item.get('sell_price')
+        area = item.get('area')
+        complex_name = item.get('complex')
+        
+        # Загружаем third_map
+        third_map = await self._load_third_map()
+        
+        if not third_map or not complex_name:
+            return 'C'
+        
+        # Ищем параметры для ЖК
+        params = self._find_complex_in_map(complex_name, third_map)
+        if not params:
+            return 'C'
+        
+        roof = params.get('roof')
+        window = params.get('window')
+        score = params.get('score')
+        
+        # Вычисляем window_price и roof_price
+        window_price = (window * area) if (window is not None and area is not None) else None
+        roof_price = (roof * area) if (roof is not None and area is not None) else None
+        
+        # Используем sell_price как contract_price
+        contract_price = sell_price
+        
+        # Применяем формулу категоризации
+        return assign_category(contract_price, window_price, roof_price, score)
+    
+    async def upsert_parsed_properties(self, items: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """Добавляет или обновляет объекты parsed_properties с автокатегоризацией"""
+        if not items:
+            return 0, 0
+        inserted = 0
+        updated = 0
+        try:
+            # Вычисляем категорию для каждого элемента перед вставкой
+            for item in items:
+                if 'stats_object_category' not in item or not item.get('stats_object_category'):
+                    item['stats_object_category'] = await self._calculate_category_for_parsed(item)
+            
+            async with self.async_session() as session:
+                for batch in chunk_list(items, 200):
+                    if not batch:
+                        continue
+                    stmt = pg_insert(parsed_properties_table).values(batch)
+                    updatable_fields = {
+                        "krisha_id": stmt.excluded.krisha_id,
+                        "krisha_date": stmt.excluded.krisha_date,
+                        "object_type": stmt.excluded.object_type,
+                        "address": stmt.excluded.address,
+                        "complex": stmt.excluded.complex,
+                        "builder": stmt.excluded.builder,
+                        "flat_type": stmt.excluded.flat_type,
+                        "property_class": stmt.excluded.property_class,
+                        "condition": stmt.excluded.condition,
+                        "sell_price": stmt.excluded.sell_price,
+                        "sell_price_per_m2": stmt.excluded.sell_price_per_m2,
+                        "address_type": stmt.excluded.address_type,
+                        "house_num": stmt.excluded.house_num,
+                        "floor_num": stmt.excluded.floor_num,
+                        "floor_count": stmt.excluded.floor_count,
+                        "room_count": stmt.excluded.room_count,
+                        "phones": stmt.excluded.phones,
+                        "description": stmt.excluded.description,
+                        "ceiling_height": stmt.excluded.ceiling_height,
+                        "area": stmt.excluded.area,
+                        "year_built": stmt.excluded.year_built,
+                        "wall_type": stmt.excluded.wall_type,
+                        "stats_agent_given": stmt.excluded.stats_agent_given,
+                        "stats_time_given": stmt.excluded.stats_time_given,
+                        "stats_object_status": stmt.excluded.stats_object_status,
+                        "stats_recall_time": stmt.excluded.stats_recall_time,
+                        "stats_description": stmt.excluded.stats_description,
+                        "stats_object_category": stmt.excluded.stats_object_category,
+                        "updated_at": func.now(),
+                    }
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=[parsed_properties_table.c.rbd_id],
+                        set_=updatable_fields,
+                    )
+                    result = await session.execute(stmt)
+                    rowcount = result.rowcount or 0
+                    inserted_count = len(batch)
+                    updated_count = max(rowcount - inserted_count, 0)
+                    inserted += inserted_count
+                    updated += updated_count
+                await session.commit()
+            return inserted, updated
+        except Exception as e:
+            logger.error(f"Ошибка upsert parsed_properties: {e}", exc_info=True)
+            return inserted, updated
+
+    async def get_existing_rbd_ids(self, rbd_ids: List[int]) -> set:
+        if not rbd_ids:
+            return set()
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT rbd_id FROM parsed_properties WHERE rbd_id = ANY(:ids)
+                """), {"ids": rbd_ids})
+                return {row.rbd_id for row in result.fetchall()}
+        except Exception as e:
+            logger.error(f"Ошибка count_existing_rbd_ids: {e}")
+            return set()
+
+    async def fetch_parsed_properties_for_archive(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        try:
+            sql = """
+                SELECT vitrina_id, krisha_id, stats_object_status
+                FROM parsed_properties
+                WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                  AND (stats_object_status IS NULL OR stats_object_status != 'Архив')
+            """
+            if limit:
+                sql += " LIMIT :limit"
+            async with self.async_session() as session:
+                result = await session.execute(text(sql), {"limit": limit} if limit else {})
+                return [
+                    {"vitrina_id": row.vitrina_id, "krisha_id": row.krisha_id, "stats_object_status": row.stats_object_status}
+                    for row in result.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"Ошибка fetch_parsed_properties_for_archive: {e}")
+            return []
+
+    async def mark_parsed_property_archived(self, vitrina_id: int) -> None:
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("""
+                    UPDATE parsed_properties
+                    SET stats_object_status = 'Архив',
+                        updated_at = NOW()
+                    WHERE vitrina_id = :vitrina_id
+                """), {"vitrina_id": vitrina_id})
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка mark_parsed_property_archived: {e}")
+
+    async def update_parsed_property_status(
+        self, 
+        vitrina_id: int, 
+        status: str, 
+        recall_time: Optional[datetime] = None
+    ) -> bool:
+        """Обновляет статус объекта и опционально время перезвона"""
+        try:
+            async with self.async_session() as session:
+                if recall_time is not None:
+                    # Обновляем статус и время перезвона
+                    await session.execute(text("""
+                        UPDATE parsed_properties
+                        SET stats_object_status = :status,
+                            stats_recall_time = :recall_time,
+                            updated_at = NOW()
+                        WHERE vitrina_id = :vitrina_id
+                    """), {
+                        "status": status,
+                        "recall_time": recall_time,
+                        "vitrina_id": vitrina_id
+                    })
+                else:
+                    # Обновляем только статус, очищаем время перезвона если статус не "Перезвонить"
+                    if status != "Перезвонить":
+                        await session.execute(text("""
+                            UPDATE parsed_properties
+                            SET stats_object_status = :status,
+                                stats_recall_time = NULL,
+                                updated_at = NOW()
+                            WHERE vitrina_id = :vitrina_id
+                        """), {
+                            "status": status,
+                            "vitrina_id": vitrina_id
+                        })
+                    else:
+                        await session.execute(text("""
+                            UPDATE parsed_properties
+                            SET stats_object_status = :status,
+                                updated_at = NOW()
+                            WHERE vitrina_id = :vitrina_id
+                        """), {
+                            "status": status,
+                            "vitrina_id": vitrina_id
+                        })
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка update_parsed_property_status для {vitrina_id}: {e}", exc_info=True)
+            return False
+
+    async def add_parsed_property_comment(self, vitrina_id: int, comment: str) -> bool:
+        """Добавляет комментарий к объекту. Комментарии разделяются через ';' с датой/временем."""
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            
+            # Проверяем, что в комментарии нет ';'
+            if ';' in comment:
+                return False
+            
+            async with self.async_session() as session:
+                # Получаем текущий комментарий
+                result = await session.execute(text("""
+                    SELECT stats_description FROM parsed_properties WHERE vitrina_id = :vitrina_id
+                """), {"vitrina_id": vitrina_id})
+                row = result.fetchone()
+                current_comment = row.stats_description if row else None
+                
+                # Формируем новую запись с датой/временем
+                almaty_tz = ZoneInfo("Asia/Almaty")
+                now = datetime.now(almaty_tz)
+                new_entry = f"{now.strftime('%d.%m.%Y %H:%M')} - {comment};"
+                
+                # Добавляем к существующему комментарию
+                if current_comment:
+                    updated_comment = current_comment + " " + new_entry
+                else:
+                    updated_comment = new_entry
+                
+                # Обновляем в БД
+                await session.execute(text("""
+                    UPDATE parsed_properties
+                    SET stats_description = :comment,
+                        updated_at = NOW()
+                    WHERE vitrina_id = :vitrina_id
+                """), {
+                    "comment": updated_comment,
+                    "vitrina_id": vitrina_id
+                })
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка add_parsed_property_comment для {vitrina_id}: {e}", exc_info=True)
+            return False
+
+    async def get_parsed_properties_for_recall_notification(self) -> List[Dict[str, Any]]:
+        """Получает объекты, которым нужно отправить уведомление о перезвоне"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT vitrina_id, stats_agent_given, stats_recall_time, address, krisha_id
+                    FROM parsed_properties
+                    WHERE stats_object_status = 'Перезвонить'
+                      AND stats_recall_time IS NOT NULL
+                      AND stats_recall_time <= NOW() AT TIME ZONE 'Asia/Almaty'
+                      AND stats_agent_given IS NOT NULL
+                """))
+                return [
+                    {
+                        "vitrina_id": row.vitrina_id,
+                        "agent_phone": row.stats_agent_given,
+                        "recall_time": row.stats_recall_time,
+                        "address": row.address,
+                        "krisha_id": row.krisha_id
+                    }
+                    for row in result.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"Ошибка get_parsed_properties_for_recall_notification: {e}", exc_info=True)
+            return []
+
+    async def mark_recall_notification_sent(self, vitrina_id: int) -> None:
+        """Помечает, что уведомление о перезвоне было отправлено (очищает stats_recall_time)"""
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("""
+                    UPDATE parsed_properties
+                    SET stats_recall_time = NULL,
+                        updated_at = NOW()
+                    WHERE vitrina_id = :vitrina_id
+                """), {"vitrina_id": vitrina_id})
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка mark_recall_notification_sent для {vitrina_id}: {e}", exc_info=True)
 
     async def close(self):
         """Закрывает подключение к базе данных"""

@@ -1,5 +1,6 @@
 python-telegram-bot[webhooks]
 python-dotenv
+requests
 httpx
 pyppeteer==2.0.0
 

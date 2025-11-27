@@ -74,3 +74,4 @@ credentials.json
 
 # Local .py files
 find_duplicates.py
+rbd_parser.py

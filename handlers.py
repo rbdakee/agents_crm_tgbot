@@ -202,7 +202,7 @@ def build_main_menu_keyboard_by_role(context: ContextTypes.DEFAULT_TYPE) -> Inli
         keyboard.append([InlineKeyboardButton("Мои МОП-ы", callback_data="my_mops")])
     keyboard.append([InlineKeyboardButton("Мои объекты", callback_data="my_contracts")])
     if role == ROLE_MOP:
-        keyboard.append([InlineKeyboardButton("Новые объекты", callback_data="new_objects")])
+        keyboard.append([InlineKeyboardButton("Холодные звонки", callback_data="new_objects")])
     if role in {ROLE_ROP, ROLE_DD}:
         keyboard.append([InlineKeyboardButton("Поиск", callback_data="search")])
     else:
@@ -1172,7 +1172,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vitrina_id = int(data.replace("change_status_", ""))
         await show_status_selection(update, context, vitrina_id)
     
-    elif data.startswith("status_"):
+    # Ветку для статусов парсенных объектов держим отдельно и исключаем status_menu_,
+    # чтобы не перехватывать коллбеки смены статуса контрактов.
+    elif data.startswith("status_") and not data.startswith("status_menu_"):
         # Формат: status_Договор_123 или status_Перезвонить_123
         parts = data.split("_")
         if len(parts) >= 3:
@@ -4090,6 +4092,7 @@ async def show_my_objects_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("📋 Все объекты", callback_data="my_objects_filter_all")],
         [InlineKeyboardButton("⏳ Не реализовано", callback_data="my_objects_filter_non_realized")],
         [InlineKeyboardButton("✅ Реализовано", callback_data="my_objects_filter_realized")],
+        [InlineKeyboardButton("➕ Добавить 10 объектов", callback_data="add_bulk_objects")],
         [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
     ]
     

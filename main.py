@@ -57,6 +57,7 @@ async def run_auto_tasks_scheduler(application: Application):
         target_time = time(2, 0)
     
     last_run_date = None
+    is_running = False
     
     while True:
         try:
@@ -67,29 +68,27 @@ async def run_auto_tasks_scheduler(application: Application):
             # Проверяем, наступило ли время запуска и не запускали ли мы уже сегодня
             if (current_time.hour == target_time.hour and 
                 current_time.minute == target_time.minute and
-                last_run_date != current_date):
+                last_run_date != current_date and
+                not is_running):
                 
                 logging.info(f"Запуск автоматических задач в {AUTO_TASKS_TIME}")
                 last_run_date = current_date
-                
-                # Запускаем задачи асинхронно, не блокируя основной поток
-                async def run_tasks():
-                    try:
-                        # Запускаем get_new_objects
-                        logging.info("Запуск автоматического get_new_objects...")
-                        stats = await fetch_new_objects()
-                        logging.info(f"Автоматический get_new_objects завершен: {stats}")
-                        
-                        # Запускаем archive
-                        logging.info("Запуск автоматического archive...")
-                        archive_stats = await archive_missing_objects()
-                        logging.info(f"Автоматический archive завершен: {archive_stats}")
-                        
-                    except Exception as e:
-                        logging.error(f"Ошибка при выполнении автоматических задач: {e}", exc_info=True)
-                
-                # Запускаем задачи в фоне
-                asyncio.create_task(run_tasks())
+                is_running = True
+
+                try:
+                    # Последовательно выполняем автопарсинг и автоархивирование
+                    logging.info("Запуск автоматического get_new_objects...")
+                    stats = await fetch_new_objects()
+                    logging.info(f"Автоматический get_new_objects завершен: {stats}")
+
+                    logging.info("Запуск автоматического archive...")
+                    archive_stats = await archive_missing_objects()
+                    logging.info(f"Автоматический archive завершен: {archive_stats}")
+
+                except Exception as e:
+                    logging.error(f"Ошибка при выполнении автоматических задач: {e}", exc_info=True)
+                finally:
+                    is_running = False
             
             # Проверяем каждую минуту
             await asyncio.sleep(60)

@@ -220,30 +220,95 @@ class PostgreSQLManager:
             logger.error(f"Ошибка ensure_schema_with_backup: {e}")
     
     async def ensure_parsed_properties_schema(self) -> None:
-        """Проверяет наличие колонки stats_object_category в parsed_properties.
-        Если отсутствует — добавляет её. Операция идемпотентная и безопасная.
-        """
+        """Гарантирует наличие таблицы parsed_properties и колонки stats_object_category."""
         try:
             async with self.async_session() as session:
-                # Проверяем наличие колонки
+                # Проверяем наличие таблицы parsed_properties
+                table_check = await session.execute(text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'parsed_properties'
+                    )
+                """))
+                table_exists = table_check.scalar()
+
+                if not table_exists:
+                    logger.info("Таблица parsed_properties не найдена — создаю...")
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS parsed_properties (
+                            vitrina_id BIGSERIAL PRIMARY KEY,
+                            rbd_id BIGINT UNIQUE NOT NULL,
+                            krisha_id VARCHAR(64),
+                            krisha_date TIMESTAMPTZ,
+                            object_type VARCHAR(255),
+                            address TEXT,
+                            complex VARCHAR(255),
+                            builder VARCHAR(255),
+                            flat_type VARCHAR(255),
+                            property_class VARCHAR(255),
+                            condition VARCHAR(255),
+                            sell_price DOUBLE PRECISION,
+                            sell_price_per_m2 DOUBLE PRECISION,
+                            address_type VARCHAR(255),
+                            house_num VARCHAR(255),
+                            floor_num INTEGER,
+                            floor_count INTEGER,
+                            room_count INTEGER,
+                            phones VARCHAR(255),
+                            description TEXT,
+                            ceiling_height DOUBLE PRECISION,
+                            area DOUBLE PRECISION,
+                            year_built INTEGER,
+                            wall_type VARCHAR(255),
+                            stats_agent_given VARCHAR(255),
+                            stats_time_given TIMESTAMPTZ,
+                            stats_object_status VARCHAR(255),
+                            stats_recall_time TIMESTAMPTZ,
+                            stats_description TEXT,
+                            stats_object_category VARCHAR(10),
+                            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """))
+
+                    # Создаем основные индексы
+                    index_statements = [
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_created ON parsed_properties(created_at)",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_krisha_id ON parsed_properties(krisha_id) WHERE krisha_id IS NOT NULL AND krisha_id != ''",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_agent_given ON parsed_properties(stats_agent_given) WHERE stats_agent_given IS NOT NULL",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_status ON parsed_properties(stats_object_status) WHERE stats_object_status IS NOT NULL",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_recall_time ON parsed_properties(stats_recall_time) WHERE stats_recall_time IS NOT NULL",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_recall_notification ON parsed_properties(stats_object_status, stats_recall_time, stats_agent_given) WHERE stats_object_status = 'Перезвонить' AND stats_recall_time IS NOT NULL AND stats_agent_given IS NOT NULL",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_latest ON parsed_properties(krisha_id, stats_agent_given, krisha_date DESC) WHERE krisha_id IS NOT NULL AND krisha_id != ''",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_time_given ON parsed_properties(stats_time_given DESC NULLS LAST)",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_my_objects ON parsed_properties(stats_agent_given, stats_time_given DESC NULLS LAST, vitrina_id DESC) WHERE stats_agent_given IS NOT NULL",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_archive ON parsed_properties(stats_object_status, krisha_id) WHERE krisha_id IS NOT NULL AND krisha_id != '' AND (stats_object_status IS NULL OR stats_object_status != 'Архив')"
+                    ]
+                    for stmt in index_statements:
+                        await session.execute(text(stmt))
+
+                    await session.commit()
+                    logger.info("Таблица parsed_properties создана вместе с индексами")
+
+                # Проверяем наличие колонки stats_object_category
                 col_check = await session.execute(text("""
                     SELECT column_name FROM information_schema.columns
                     WHERE table_name = 'parsed_properties'
                       AND column_name = 'stats_object_category'
                 """))
-                exists = col_check.fetchone() is not None
-                
-                if exists:
+                column_exists = col_check.fetchone() is not None
+
+                if not column_exists:
+                    logger.info("Добавляю колонку stats_object_category в parsed_properties...")
+                    await session.execute(text("""
+                        ALTER TABLE parsed_properties 
+                        ADD COLUMN IF NOT EXISTS stats_object_category VARCHAR(10)
+                    """))
+                    await session.commit()
+                    logger.info("Колонка stats_object_category успешно добавлена в parsed_properties")
+                else:
                     logger.info("Колонка stats_object_category уже существует в parsed_properties")
-                    return
-                
-                logger.info("Добавляю колонку stats_object_category в parsed_properties...")
-                await session.execute(text("""
-                    ALTER TABLE parsed_properties 
-                    ADD COLUMN IF NOT EXISTS stats_object_category VARCHAR(10)
-                """))
-                await session.commit()
-                logger.info("Колонка stats_object_category успешно добавлена в parsed_properties")
+
         except Exception as e:
             logger.error(f"Ошибка ensure_parsed_properties_schema: {e}", exc_info=True)
     

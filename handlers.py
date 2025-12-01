@@ -35,6 +35,7 @@ from config import (
     SUPPORT_URL,
     RECALL_CHECK_INTERVAL_SECONDS,
     BULK_ASSIGN_COUNT,
+    ADMIN_VIEW_PHONES,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,24 @@ async def run_archive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ROLE_MOP = 'МОП'
 ROLE_ROP = 'РОП'
 ROLE_DD = 'ДД'
+ROLE_ADMIN_VIEW = 'ADMIN_VIEW'
+
+# Кол-во записей на страницу в админских списках (ДД/РОП/МОП)
+ADMIN_LIST_PAGE_SIZE = 10
+
+
+def is_admin_view_phone(phone: Optional[str]) -> bool:
+    """Проверяет, относится ли номер к ADMIN_VIEW_PHONES (10-значный номер без +7/8)."""
+    if not phone:
+        return False
+    # Используем ту же нормализацию, что и для других проверок ролей
+    digits_only = ''.join(c for c in phone if c.isdigit())
+    if len(digits_only) == 11 and (digits_only.startswith('7') or digits_only.startswith('8')):
+        digits_only = digits_only[1:]
+    if len(digits_only) != 10:
+        return False
+    return digits_only in ADMIN_VIEW_PHONES
+
 
 def set_user_role(context: ContextTypes.DEFAULT_TYPE, role: str) -> None:
     context.user_data['role'] = role
@@ -188,13 +207,26 @@ def build_role_select_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyb
         [InlineKeyboardButton(ROLE_MOP, callback_data=f"select_role_{ROLE_MOP}")],
         [InlineKeyboardButton(ROLE_ROP, callback_data=f"select_role_{ROLE_ROP}")],
     ]
+    # ADMIN_VIEW не выбирается пользователем вручную — назначается автоматически по номеру телефона
     if is_dd_allowed(context):
         keyboard.append([InlineKeyboardButton(ROLE_DD, callback_data=f"select_role_{ROLE_DD}")])
     return InlineKeyboardMarkup(keyboard)
 
 def build_main_menu_keyboard_by_role(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
     role = get_user_role(context)
-    keyboard = []
+    # Отдельное главное меню для ADMIN_VIEW
+    if role == ROLE_ADMIN_VIEW:
+        keyboard = [
+            [InlineKeyboardButton("ДД", callback_data="admin_dds")],
+            [InlineKeyboardButton("РОП-ы", callback_data="admin_rops_root")],
+            [InlineKeyboardButton("МОП-ы", callback_data="admin_mops_root")],
+            [InlineKeyboardButton("Объекты", callback_data="admin_objects_root")],
+            [InlineKeyboardButton("Поиск", callback_data="search")],
+            [InlineKeyboardButton("🚪 Выйти", callback_data="logout_confirm")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    keyboard: List[List[InlineKeyboardButton]] = []
     if role == ROLE_ROP:
         keyboard.append([InlineKeyboardButton("Мои МОП-ы", callback_data="my_mops")])
     if role == ROLE_DD:
@@ -207,7 +239,6 @@ def build_main_menu_keyboard_by_role(context: ContextTypes.DEFAULT_TYPE) -> Inli
         keyboard.append([InlineKeyboardButton("Поиск", callback_data="search")])
     else:
         keyboard.append([InlineKeyboardButton("Поиск по имени клиента", callback_data="search_client")])
-    # keyboard.append([InlineKeyboardButton("Написать в поддержку", url="https://t.me/rbdakee")])
     keyboard.append([InlineKeyboardButton("Поменять роль", callback_data="change_role")])
     keyboard.append([InlineKeyboardButton("🚪 Выйти", callback_data="logout_confirm")])
     return InlineKeyboardMarkup(keyboard)
@@ -1079,8 +1110,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if agent_name:
                         db_manager = await get_db_manager()
                         role = get_user_role(context)
-                        name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
-                        contracts, total_count = await db_manager.search_contracts_by_client_name_lazy(search_query, name_for_query, page_num, CONTRACTS_PER_PAGE, role)
+                        if role == ROLE_ADMIN_VIEW:
+                            contracts, total_count = await db_manager.search_contracts_by_client_name_lazy(
+                                search_query, agent_name, page_num, CONTRACTS_PER_PAGE, ROLE_ADMIN_VIEW
+                            )
+                        else:
+                            name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
+                            contracts, total_count = await db_manager.search_contracts_by_client_name_lazy(
+                                search_query, name_for_query, page_num, CONTRACTS_PER_PAGE, role
+                            )
                         await show_search_results_page_lazy(query, contracts, page_num, total_count, search_query, agent_name)
 
     elif data == "back_to_main" or data == "main_menu":
@@ -1097,12 +1135,90 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup
             )
 
+    elif data == "admin_dds" or data.startswith("admin_dds_page_"):
+        # Список всех ДД для ADMIN_VIEW с пагинацией по ADMIN_LIST_PAGE_SIZE
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        page = 1
+        if data.startswith("admin_dds_page_"):
+            try:
+                page = int(data.replace("admin_dds_page_", ""))
+            except Exception:
+                page = 1
+
+        db_manager = await get_db_manager()
+        dds = context.user_data.get('admin_dds')
+        if not dds:
+            dds = await db_manager.get_dds_with_counts()
+            context.user_data['admin_dds'] = dds
+
+        total_count = len(dds)
+        page_size = ADMIN_LIST_PAGE_SIZE
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_count)
+        page_items = dds[start_idx:end_idx]
+
+        message_lines = ["ДД:"]
+        keyboard: List[List[InlineKeyboardButton]] = []
+        for i, item in enumerate(page_items):
+            idx = start_idx + i
+            full_name = (item.get('name') or 'Не указан').strip()
+            cnt = item.get('count', 0)
+            message_lines.append(f"{idx+1}. {full_name} ({cnt} объектов)")
+            keyboard.append([InlineKeyboardButton(
+                f"{full_name} ({cnt})",
+                callback_data=f"admin_dd_select_{idx}"
+            )])
+        if not dds:
+            message_lines.append("ДД не найдены")
+
+        # Пагинация
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_dds_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_dds_page_{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_dd_select_"):
+        # Меню по конкретному ДД
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        try:
+            idx = int(data.replace("admin_dd_select_", "").strip())
+        except Exception:
+            await query.edit_message_text("❌ Ошибка формата данных")
+            return
+        dds = context.user_data.get('admin_dds') or []
+        if idx < 0 or idx >= len(dds):
+            await query.edit_message_text("❌ ДД не найден")
+            return
+        dd_name = dds[idx].get('name') or 'Не указан'
+        context.user_data['admin_current_dd'] = dd_name
+        message = f"ДД: {dd_name}\nВыберите действие:"
+        keyboard = [
+            [InlineKeyboardButton("РОП-ы этого ДД", callback_data=f"admin_dd_rops_{idx}")],
+            [InlineKeyboardButton("МОП-ы этого ДД", callback_data=f"admin_dd_mops_{idx}")],
+            [InlineKeyboardButton("Объекты этого ДД", callback_data=f"admin_dd_objects_{idx}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin_dds")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+        ]
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+
     elif data == "search":
         # Меню выбора вида поиска
         role = get_user_role(context)
         keyboard = []
         
-        if role == ROLE_DD:
+        if role in {ROLE_DD, ROLE_ADMIN_VIEW}:
             keyboard.append([InlineKeyboardButton("Найти РОП-а по имени", callback_data="search_rop")])
             keyboard.append([InlineKeyboardButton("Найти МОП-а по имени", callback_data="search_mop")])
             keyboard.append([InlineKeyboardButton("Найти объект по имени клиента", callback_data="search_client")])
@@ -1122,6 +1238,482 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="main_menu")])
         await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_dd_rops_"):
+        # Все РОП-ы конкретного ДД (ADMIN_VIEW) с пагинацией по ADMIN_LIST_PAGE_SIZE
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+
+        # Форматы: admin_dd_rops_{dd_idx} или admin_dd_rops_{dd_idx}_page_{page}
+        page = 1
+        data_rest = data.replace("admin_dd_rops_", "")
+        if "_page_" in data_rest:
+            dd_idx_str, page_str = data_rest.split("_page_", 1)
+            try:
+                page = int(page_str)
+            except Exception:
+                page = 1
+        else:
+            dd_idx_str = data_rest
+
+        try:
+            dd_idx = int(dd_idx_str.strip())
+        except Exception:
+            await query.edit_message_text("❌ Ошибка формата данных")
+            return
+
+        dds = context.user_data.get('admin_dds') or []
+        if dd_idx < 0 or dd_idx >= len(dds):
+            await query.edit_message_text("❌ ДД не найден")
+            return
+        dd_name = dds[dd_idx].get('name') or 'Не указан'
+
+        db_manager = await get_db_manager()
+        totals = await db_manager.get_role_totals(dd_name, ROLE_DD)
+        rops = await db_manager.get_subordinates(dd_name, ROLE_DD, subordinate_role=ROLE_ROP)
+
+        # Строим полный список rops_menu (с pending), если его ещё нет
+        rops_menu: List[Dict] = []
+        for item in rops:
+            full_name = (item.get('name') or 'Не указан').strip()
+            cnt = item.get('count', 0)
+            name_parts = full_name.split()
+            display_name = ' '.join(name_parts[:2]) if name_parts else full_name
+            pending = await db_manager.count_pending_tasks_for_rop(full_name)
+            rops_menu.append({
+                'name': full_name,
+                'count': cnt,
+                'pending': pending,
+                'display': display_name,
+            })
+        context.user_data['rops_menu'] = rops_menu
+
+        total_count = len(rops_menu)
+        page_size = ADMIN_LIST_PAGE_SIZE
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_count)
+        page_items = rops_menu[start_idx:end_idx]
+
+        message_lines = [
+            f"РОП-ы ДД: {dd_name}",
+            f"Всего объектов: {totals.get('total', 0)}",
+            f"Объектов с категорией А: {totals.get('cat_A', 0)}",
+            f"Объектов с категорией В: {totals.get('cat_B', 0)}",
+            f"Объектов с категорией С: {totals.get('cat_C', 0)}",
+            "",
+        ]
+        keyboard: List[List[InlineKeyboardButton]] = []
+        for i, item in enumerate(page_items):
+            idx = start_idx + i
+            message_lines.append(f"{idx+1}. {item['display']} (📋{item['count']}/🚩{item['pending']})")
+            keyboard.append([InlineKeyboardButton(
+                f"{item['display']} (📋{item['count']}/🚩{item['pending']})",
+                callback_data=f"rop_filter_{idx}"
+            )])
+
+        # Пагинация
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_dd_rops_{dd_idx}_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_dd_rops_{dd_idx}_page_{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"admin_dd_select_{dd_idx}")])
+        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_dd_mops_"):
+        # Все МОП-ы конкретного ДД (ADMIN_VIEW) с пагинацией по ADMIN_LIST_PAGE_SIZE
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+
+        # Форматы: admin_dd_mops_{dd_idx} или admin_dd_mops_{dd_idx}_page_{page}
+        page = 1
+        data_rest = data.replace("admin_dd_mops_", "")
+        if "_page_" in data_rest:
+            dd_idx_str, page_str = data_rest.split("_page_", 1)
+            try:
+                page = int(page_str)
+            except Exception:
+                page = 1
+        else:
+            dd_idx_str = data_rest
+
+        try:
+            dd_idx = int(dd_idx_str.strip())
+        except Exception:
+            await query.edit_message_text("❌ Ошибка формата данных")
+            return
+
+        dds = context.user_data.get('admin_dds') or []
+        if dd_idx < 0 or dd_idx >= len(dds):
+            await query.edit_message_text("❌ ДД не найден")
+            return
+        dd_name = dds[dd_idx].get('name') or 'Не указан'
+
+        db_manager = await get_db_manager()
+        totals = await db_manager.get_role_totals(dd_name, ROLE_DD)
+        mops = await db_manager.get_subordinates(dd_name, ROLE_DD, subordinate_role=ROLE_MOP)
+
+        # Полный список МОП-ов для данного ДД
+        mops_menu: List[Dict] = []
+        for item in mops:
+            full_name = (item.get('name') or 'Не указан').strip()
+            cnt = item.get('count', 0)
+            name_parts = full_name.split()
+            display_name = ' '.join(name_parts[:2]) if name_parts else full_name
+            pending = await db_manager.count_pending_tasks_for_mop(full_name)
+            mops_menu.append({
+                'name': full_name,
+                'count': cnt,
+                'pending': pending,
+                'display': display_name,
+            })
+        context.user_data['mops_menu'] = mops_menu
+
+        total_count = len(mops_menu)
+        page_size = ADMIN_LIST_PAGE_SIZE
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_count)
+        page_items = mops_menu[start_idx:end_idx]
+
+        message_lines = [
+            f"МОП-ы ДД: {dd_name}",
+            f"Всего объектов: {totals.get('total', 0)}",
+            f"Объектов с категорией А: {totals.get('cat_A', 0)}",
+            f"Объектов с категорией В: {totals.get('cat_B', 0)}",
+            f"Объектов с категорией С: {totals.get('cat_C', 0)}",
+            "",
+        ]
+        keyboard = []
+        for i, item in enumerate(page_items):
+            idx = start_idx + i
+            message_lines.append(f"{idx+1}. {item['display']} (📋{item['count']}/🚩{item['pending']})")
+            keyboard.append([InlineKeyboardButton(
+                f"{item['display']} (📋{item['count']}/🚩{item['pending']})",
+                callback_data=f"mop_filter_{idx}"
+            )])
+
+        # Пагинация
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_dd_mops_{dd_idx}_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_dd_mops_{dd_idx}_page_{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"admin_dd_select_{dd_idx}")])
+        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_dd_objects_"):
+        # Объекты выбранного ДД (ADMIN_VIEW) с фильтрами по категориям
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        try:
+            idx = int(data.replace("admin_dd_objects_", "").strip())
+        except Exception:
+            await query.edit_message_text("❌ Ошибка формата данных")
+            return
+        dds = context.user_data.get('admin_dds') or []
+        if idx < 0 or idx >= len(dds):
+            await query.edit_message_text("❌ ДД не найден")
+            return
+        dd_name = dds[idx].get('name') or 'Не указан'
+        db_manager = await get_db_manager()
+        totals = await db_manager.get_role_totals(dd_name, ROLE_DD)
+        message = f"Объекты ДД: {dd_name}\n"
+        keyboard = [
+            [InlineKeyboardButton(f"Все объекты ({totals.get('total', 0)})", callback_data=f"admin_dd_contracts_{idx}_all")],
+            [InlineKeyboardButton(f"Категория А ({totals.get('cat_A', 0)})", callback_data=f"admin_dd_contracts_{idx}_A")],
+            [InlineKeyboardButton(f"Категория В ({totals.get('cat_B', 0)})", callback_data=f"admin_dd_contracts_{idx}_B")],
+            [InlineKeyboardButton(f"Категория С ({totals.get('cat_C', 0)})", callback_data=f"admin_dd_contracts_{idx}_C")],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"admin_dd_select_{idx}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+        ]
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_dd_contracts_"):
+        # Список объектов по ДД и категории (ADMIN_VIEW) с пагинацией
+        # Формат: admin_dd_contracts_{dd_idx}_{category} или admin_dd_contracts_{dd_idx}_{category}_page_{page}
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        data_parts = data.replace("admin_dd_contracts_", "")
+        page = 1
+        if "_page_" in data_parts:
+            idx_part, rest = data_parts.split("_page_", 1)
+            try:
+                page = int(rest.rsplit("_", 1)[-1])
+            except Exception:
+                page = 1
+            dd_idx_str, category = idx_part.rsplit("_", 1)
+        else:
+            dd_idx_str, category = data_parts.rsplit("_", 1)
+        try:
+            dd_idx = int(dd_idx_str)
+        except Exception:
+            await query.edit_message_text("❌ Ошибка формата данных")
+            return
+        dds = context.user_data.get('admin_dds') or []
+        if dd_idx < 0 or dd_idx >= len(dds):
+            await query.edit_message_text("❌ ДД не найден")
+            return
+        dd_name = dds[dd_idx].get('name') or 'Не указан'
+        db_manager = await get_db_manager()
+        category_filter = None if category == "all" else category
+        await show_loading(query)
+        contracts = await db_manager.get_dd_contracts_by_category(dd_name, category_filter)
+        if not contracts:
+            category_label = "Все объекты" if category == "all" else f"Объекты категории {category}"
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f"admin_dd_objects_{dd_idx}")]]
+            await query.edit_message_text(f"{category_label} ДД {dd_name}:\n\nОбъекты не найдены", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        # Пагинация по CONTRACTS_PER_PAGE
+        total_count = len(contracts)
+        start_idx = (page - 1) * CONTRACTS_PER_PAGE
+        end_idx = min(start_idx + CONTRACTS_PER_PAGE, total_count)
+        page_contracts = contracts[start_idx:end_idx]
+
+        message_lines = [f"Объекты ДД: {dd_name}"]
+        if category == "all":
+            message_lines.append("Все объекты:\n")
+        else:
+            message_lines.append(f"Категория {category}:\n")
+
+        keyboard_rows: List[List[InlineKeyboardButton]] = []
+        for c in page_contracts:
+            crm_id = c.get('CRM ID', 'N/A')
+            addr = c.get('Адрес', 'N/A')
+            client_info = c.get('Имя клиента и номер', 'N/A')
+            client_name_only = clean_client_name(str(client_info).split(':')[0].strip()) if isinstance(client_info, str) else str(client_info)
+            message_lines.append(f"CRM ID: {crm_id}\nКлиент: {client_name_only}\nАдрес: {addr}\n")
+            keyboard_rows.append([InlineKeyboardButton(
+                f"CRM ID: {crm_id}",
+                callback_data=f"contract_{crm_id}_filter_{category}"
+            )])
+
+        # Пагинация кнопками
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_dd_contracts_{dd_idx}_{category}_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_dd_contracts_{dd_idx}_{category}_page_{page+1}"))
+        if nav_buttons:
+            keyboard_rows.append(nav_buttons)
+
+        keyboard_rows.append([InlineKeyboardButton("🔙 Назад", callback_data=f"admin_dd_objects_{dd_idx}")])
+        keyboard_rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode='Markdown')
+
+    elif data == "admin_rops_root" or data.startswith("admin_rops_root_page_"):
+        # Все РОП-ы по базе (ADMIN_VIEW) с пагинацией
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        page = 1
+        if data.startswith("admin_rops_root_page_"):
+            try:
+                page = int(data.replace("admin_rops_root_page_", ""))
+            except Exception:
+                page = 1
+
+        db_manager = await get_db_manager()
+        rops_menu = context.user_data.get('rops_menu')
+        if not rops_menu:
+            rops = await db_manager.search_rops_by_name("", None)
+            rops_menu = []
+            for item in rops:
+                full_name = (item.get('name') or 'Не указан').strip()
+                cnt = item.get('count', 0)
+                name_parts = full_name.split()
+                display_name = ' '.join(name_parts[:2]) if name_parts else full_name
+                pending = await db_manager.count_pending_tasks_for_rop(full_name)
+                rops_menu.append({
+                    'name': full_name,
+                    'count': cnt,
+                    'pending': pending,
+                    'display': display_name,
+                })
+            context.user_data['rops_menu'] = rops_menu
+
+        total_count = len(rops_menu)
+        page_size = ADMIN_LIST_PAGE_SIZE
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_count)
+        page_items = rops_menu[start_idx:end_idx]
+
+        message_lines = ["Все РОП-ы:"]
+        keyboard: List[List[InlineKeyboardButton]] = []
+        for i, item in enumerate(page_items):
+            idx = start_idx + i
+            message_lines.append(f"{idx+1}. {item['display']} (📋{item['count']}/🚩{item['pending']})")
+            keyboard.append([InlineKeyboardButton(
+                f"{item['display']} (📋{item['count']}/🚩{item['pending']})",
+                callback_data=f"rop_filter_{idx}"
+            )])
+
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_rops_root_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_rops_root_page_{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "admin_mops_root" or data.startswith("admin_mops_root_page_"):
+        # Все МОП-ы по базе (ADMIN_VIEW) с пагинацией
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        page = 1
+        if data.startswith("admin_mops_root_page_"):
+            try:
+                page = int(data.replace("admin_mops_root_page_", ""))
+            except Exception:
+                page = 1
+
+        db_manager = await get_db_manager()
+        mops_menu = context.user_data.get('mops_menu')
+        if not mops_menu:
+            mops = await db_manager.get_all_mops_with_counts()
+            mops_menu = []
+            for item in mops:
+                full_name = (item.get('name') or 'Не указан').strip()
+                cnt = item.get('count', 0)
+                name_parts = full_name.split()
+                display_name = ' '.join(name_parts[:2]) if name_parts else full_name
+                pending = await db_manager.count_pending_tasks_for_mop(full_name)
+                mops_menu.append({
+                    'name': full_name,
+                    'count': cnt,
+                    'pending': pending,
+                    'display': display_name,
+                })
+            context.user_data['mops_menu'] = mops_menu
+
+        total_count = len(mops_menu)
+        page_size = ADMIN_LIST_PAGE_SIZE
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_count)
+        page_items = mops_menu[start_idx:end_idx]
+
+        message_lines = ["Все МОП-ы:"]
+        keyboard = []
+        for i, item in enumerate(page_items):
+            idx = start_idx + i
+            message_lines.append(f"{idx+1}. {item['display']} (📋{item['count']}/🚩{item['pending']})")
+            keyboard.append([InlineKeyboardButton(
+                f"{item['display']} (📋{item['count']}/🚩{item['pending']})",
+                callback_data=f"mop_filter_{idx}"
+            )])
+
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_mops_root_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_mops_root_page_{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "admin_objects_root":
+        # Глобальные объекты по всей базе с фильтрами по категориям (ADMIN_VIEW)
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        db_manager = await get_db_manager()
+        totals = await db_manager.get_global_totals()
+        message = "Все объекты по базе:\n"
+        keyboard = [
+            [InlineKeyboardButton(f"Все объекты ({totals.get('total', 0)})", callback_data="admin_global_contracts_all")],
+            [InlineKeyboardButton(f"Категория А ({totals.get('cat_A', 0)})", callback_data="admin_global_contracts_A")],
+            [InlineKeyboardButton(f"Категория В ({totals.get('cat_B', 0)})", callback_data="admin_global_contracts_B")],
+            [InlineKeyboardButton(f"Категория С ({totals.get('cat_C', 0)})", callback_data="admin_global_contracts_C")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")],
+        ]
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_global_contracts_"):
+        # Глобальный список объектов по категории (ADMIN_VIEW)
+        # Формат: admin_global_contracts_{category} или admin_global_contracts_{category}_page_{page}
+        role = get_user_role(context)
+        if role != ROLE_ADMIN_VIEW:
+            await query.edit_message_text("❌ Недоступно для вашей роли")
+            return
+        data_parts = data.replace("admin_global_contracts_", "")
+        page = 1
+        if "_page_" in data_parts:
+            category, page_str = data_parts.split("_page_", 1)
+            try:
+                page = int(page_str)
+            except Exception:
+                page = 1
+        else:
+            category = data_parts
+        db_manager = await get_db_manager()
+        await show_loading(query)
+        category_filter = None if category == "all" else category
+        contracts = await db_manager.get_global_contracts_by_category(category_filter)
+        if not contracts:
+            category_label = "Все объекты" if category == "all" else f"Объекты категории {category}"
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_objects_root")]]
+            await query.edit_message_text(f"{category_label}:\n\nОбъекты не найдены", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        total_count = len(contracts)
+        start_idx = (page - 1) * CONTRACTS_PER_PAGE
+        end_idx = min(start_idx + CONTRACTS_PER_PAGE, total_count)
+        page_contracts = contracts[start_idx:end_idx]
+
+        message_lines = []
+        if category == "all":
+            message_lines.append("Все объекты по базе:\n")
+        else:
+            message_lines.append(f"Объекты категории {category} по базе:\n")
+
+        keyboard_rows: List[List[InlineKeyboardButton]] = []
+        for c in page_contracts:
+            crm_id = c.get('CRM ID', 'N/A')
+            addr = c.get('Адрес', 'N/A')
+            client_info = c.get('Имя клиента и номер', 'N/A')
+            client_name_only = clean_client_name(str(client_info).split(':')[0].strip()) if isinstance(client_info, str) else str(client_info)
+            message_lines.append(f"CRM ID: {crm_id}\nКлиент: {client_name_only}\nАдрес: {addr}\n")
+            keyboard_rows.append([InlineKeyboardButton(
+                f"CRM ID: {crm_id}",
+                callback_data=f"contract_{crm_id}_filter_{category}"
+            )])
+
+        nav_buttons: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"admin_global_contracts_{category}_page_{page-1}"))
+        if end_idx < total_count:
+            nav_buttons.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"admin_global_contracts_{category}_page_{page+1}"))
+        if nav_buttons:
+            keyboard_rows.append(nav_buttons)
+
+        keyboard_rows.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_objects_root")])
+        keyboard_rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+        await query.edit_message_text("\n".join(message_lines), reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode='Markdown')
 
     elif data == "new_objects":
         await show_new_objects_menu(update, context)
@@ -2541,8 +3133,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("edit_collage_"):
         # Обработка редактирования полей коллажа
         parts = data.replace("edit_collage_", "").split("_")
-        field = parts[0]
-        crm_id = parts[1]
+        # Формат callback_data: edit_collage_<field>_<crm_id>
+        # Поле может содержать подчеркивания (например, object_type), поэтому:
+        crm_id = parts[-1]
+        field = "_".join(parts[:-1])
         user_id = update.effective_user.id
         
         field_names = {
@@ -2555,29 +3149,85 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'class': 'класс жилья',
             'rop': 'имя РОП',
             'mop': 'имя МОП',
-            'benefits': 'достоинства'
+            'benefits': 'достоинства',
+            'object_type': 'тип объекта',
         }
         
         field_name = field_names.get(field, field)
         user_states[user_id] = f'editing_collage_{field}_{crm_id}'
-        
+
+        # Клавиатура "Назад" для выхода в меню создания коллажа
+        back_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"collage_edit_back_{crm_id}")]
+        ])
+
         if field == 'benefits':
             ci = user_collage_inputs.get(user_id)
             if ci and ci.benefits:
                 benefits_text = "\n".join([f"{i+1}. {benefit}" for i, benefit in enumerate(ci.benefits)])
                 await query.edit_message_text(
                     f"📋 Текущие достоинства:\n{benefits_text}\n\n"
-                    f"Введите новые достоинства (каждое с новой строки) или 'отмена' для возврата:"
+                    f"Введите новые достоинства (каждое с новой строки):",
+                    reply_markup=back_keyboard
                 )
             else:
                 await query.edit_message_text(
                     f"📋 Достоинства не заданы.\n\n"
-                    f"Введите достоинства (каждое с новой строки) или 'отмена' для возврата:"
+                    f"Введите достоинства (каждое с новой строки):",
+                    reply_markup=back_keyboard
                 )
+        elif field == 'object_type':
+            # Отдельное меню выбора типа объекта
+            type_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Квартира", callback_data=f"set_collage_type_flat_{crm_id}")],
+                [InlineKeyboardButton("Коммерческий объект", callback_data=f"set_collage_type_commercial_{crm_id}")],
+                [InlineKeyboardButton("🔙 Назад", callback_data=f"collage_back_to_menu_{crm_id}")],
+            ])
+            await query.edit_message_text(
+                "Выберите тип объекта:",
+                reply_markup=type_keyboard
+            )
         else:
             await query.edit_message_text(
-                f"✏️ Введите новое значение для поля '{field_name}' или 'отмена' для возврата:"
+                f"✏️ Введите новое значение для поля '{field_name}':",
+                reply_markup=back_keyboard
             )
+
+    elif data.startswith("set_collage_type_"):
+        # Установка типа объекта для коллажа
+        data_suffix = data.replace("set_collage_type_", "")
+        # Ожидаемый формат: "<type>_<crm_id>"
+        if "_" in data_suffix:
+            type_key, crm_id = data_suffix.split("_", 1)
+        else:
+            type_key = data_suffix
+            crm_id = ""
+
+        user_id = update.effective_user.id
+        collage_input = user_collage_inputs.get(user_id)
+        if not collage_input:
+            await update.callback_query.answer("❌ Данные коллажа не найдены. Начните заново.")
+            return
+
+        if type_key == "flat":
+            collage_input.object_type = "Квартира"
+        elif type_key == "commercial":
+            collage_input.object_type = "Коммерческий объект"
+
+        user_collage_inputs[user_id] = collage_input
+
+        # Возвращаемся в меню создания коллажа с обновлённым типом
+        await show_collage_data_with_edit_buttons(update.callback_query, collage_input, crm_id)
+
+    elif data.startswith("collage_back_to_menu_"):
+        # Кнопка "Назад" в меню выбора типа объекта
+        crm_id = data.replace("collage_back_to_menu_", "")
+        user_id = update.effective_user.id
+        collage_input = user_collage_inputs.get(user_id)
+        if collage_input:
+            await show_collage_data_with_edit_buttons(update.callback_query, collage_input, crm_id)
+        else:
+            await update.callback_query.answer("❌ Данные коллажа не найдены. Начните заново.")
 
     elif data.startswith("collage_cancel_") and not data.startswith("collage_cancel_creation_"):
         # Отмена процесса загрузки фотографий для коллажа
@@ -2605,6 +3255,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка отмены коллажа: {e}")
             await query.answer("❌ Ошибка отмены процесса")
+
+    elif data.startswith("collage_edit_back_"):
+        # Кнопка "Назад" из режима редактирования поля коллажа
+        crm_id = data.replace("collage_edit_back_", "")
+        user_id = update.effective_user.id
+        user_states[user_id] = 'authenticated'
+
+        collage_input = user_collage_inputs.get(user_id)
+        if collage_input:
+            await show_collage_data_with_edit_buttons(update.callback_query, collage_input, crm_id)
+        else:
+            await update.callback_query.answer("❌ Данные коллажа не найдены. Начните заново.")
 
     elif data.startswith("collage_save_"):
         # Сохранение результата коллажа: отметим в БД и вернем карточку
@@ -3214,7 +3876,11 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if phone:
         phone_to_chat_id[phone] = user_id
 
-    # После логина — выбор роли
+    # Если номер относится к ADMIN_VIEW_PHONES — назначаем роль ADMIN_VIEW (только просмотр, но доступ ко всем объектам)
+    if is_admin_view_phone(phone):
+        set_user_role(context, ROLE_ADMIN_VIEW)
+
+    # После логина — либо открываем сразу главное меню (для ADMIN_VIEW), либо предлагаем выбрать рабочую роль
     pending_crm_id = context.user_data.get('pending_crm_id')
     if pending_crm_id:
         del context.user_data['pending_crm_id']
@@ -3227,10 +3893,22 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loading_msg.edit_text(f"Контракт с CRM ID {pending_crm_id} не найден среди ваших сделок")
     else:
         await loading_msg.delete()
-    await update.message.reply_text(
-        "Выберите свою роль:",
-        reply_markup=build_role_select_keyboard(context),
-    )
+
+    # Если уже назначена роль (например, ADMIN_VIEW) — показываем главное меню, иначе просим выбрать роль
+    role = get_user_role(context)
+    if role:
+        agent_phone = context.user_data.get('phone')
+        header = f"{role}: {agent_name}"
+        reply_markup = build_main_menu_keyboard_by_role(context)
+        await update.message.reply_text(
+            f"{header}\nНомер: {agent_phone}\n\nВыберите действие:",
+            reply_markup=reply_markup,
+        )
+    else:
+        await update.message.reply_text(
+            "Выберите свою роль:",
+            reply_markup=build_role_select_keyboard(context),
+        )
 
 
 async def handle_client_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3245,8 +3923,17 @@ async def handle_client_search(update: Update, context: ContextTypes.DEFAULT_TYP
     
     db_manager = await get_db_manager()
     role = get_user_role(context)
-    name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
-    contracts, total_count = await db_manager.search_contracts_by_client_name_lazy(client_name, name_for_query, 1, CONTRACTS_PER_PAGE, role)
+
+    # Для ADMIN_VIEW ищем по всей базе, игнорируя конкретного агента/ДД/РОП
+    if role == ROLE_ADMIN_VIEW:
+        contracts, total_count = await db_manager.search_contracts_by_client_name_lazy(
+            client_name, agent_name, 1, CONTRACTS_PER_PAGE, ROLE_ADMIN_VIEW
+        )
+    else:
+        name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
+        contracts, total_count = await db_manager.search_contracts_by_client_name_lazy(
+            client_name, name_for_query, 1, CONTRACTS_PER_PAGE, role
+        )
     if contracts:
         if len(contracts) == 1:
             await show_contract_detail_by_contract(update, context, contracts[0])
@@ -3274,7 +3961,7 @@ async def handle_rop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent_name = context.user_data.get('agent_name')
     role = get_user_role(context)
     
-    if not agent_name or role != ROLE_DD:
+    if not agent_name or role not in {ROLE_DD, ROLE_ADMIN_VIEW}:
         await update.message.reply_text("❌ Недоступно для вашей роли")
         user_states[user_id] = 'authenticated'
         return
@@ -3282,7 +3969,8 @@ async def handle_rop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading_msg = await update.message.reply_text("Идет загрузка. Пожалуйста подождите...")
     
     db_manager = await get_db_manager()
-    dd_name = context.user_data.get('dd_query_name')
+    # Для ДД фильтруем РОП-ов по своему ДД, для ADMIN_VIEW ищем по всей базе
+    dd_name = context.user_data.get('dd_query_name') if role == ROLE_DD else None
     rops = await db_manager.search_rops_by_name(rop_name, dd_name)
     
     if not rops:
@@ -3320,7 +4008,7 @@ async def handle_mop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent_name = context.user_data.get('agent_name')
     role = get_user_role(context)
     
-    if not agent_name or role not in {ROLE_ROP, ROLE_DD}:
+    if not agent_name or role not in {ROLE_ROP, ROLE_DD, ROLE_ADMIN_VIEW}:
         await update.message.reply_text("❌ Недоступно для вашей роли")
         user_states[user_id] = 'authenticated'
         return
@@ -3328,8 +4016,14 @@ async def handle_mop_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading_msg = await update.message.reply_text("Идет загрузка. Пожалуйста подождите...")
     
     db_manager = await get_db_manager()
-    owner_name = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
-    owner_role = ROLE_DD if role == ROLE_DD else ROLE_ROP
+    # Для ADMIN_VIEW ищем МОП-ов глобально (через «ДД» без конкретного ФИО),
+    # для РОП/ДД — в рамках их зоны ответственности
+    if role == ROLE_ADMIN_VIEW:
+        owner_name = ""
+        owner_role = ROLE_DD
+    else:
+        owner_name = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
+        owner_role = ROLE_DD if role == ROLE_DD else ROLE_ROP
     
     mops = await db_manager.search_mops_by_name(mop_name, owner_name, owner_role)
     
@@ -3694,10 +4388,20 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     
     # Формируем сообщение с данными
     message = f"✅ Данные для коллажа:\n\n"
+    
+    # Тип объекта (по умолчанию Квартира)
+    object_type = getattr(collage_input, 'object_type', None) or 'Квартира'
+    message += f"🏷️ Тип объекта: {object_type}\n"
+
     message += f"🏢 Название ЖК/Объекта: {collage_input.complex_name}\n"
     message += f"📍 Адрес: {collage_input.address}\n"
     message += f"📐 Площадь: {collage_input.area_sqm} м²\n"
-    message += f"🏠 Комнат: {collage_input.rooms}\n"
+
+    # Для коммерческого объекта не показываем количество комнат
+    if object_type == 'Коммерческий объект':
+        message += f"🏠 Комнат: — (коммерческий объект)\n"
+    else:
+        message += f"🏠 Комнат: {collage_input.rooms}\n"
     message += f"🏗️ Этаж: {collage_input.floor}\n"
     message += f"💰 Цена: {collage_input.price}\n"
     message += f"🏗️ Класс жилья: {collage_input.housing_class}\n"
@@ -3713,6 +4417,7 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
     
     # Создаем кнопки для редактирования
     keyboard = [
+        [InlineKeyboardButton("🏷️ Тип объекта", callback_data=f"edit_collage_object_type_{crm_id}")],
         [
             InlineKeyboardButton("🏢 Название", callback_data=f"edit_collage_complex_{crm_id}"),
             InlineKeyboardButton("📍 Адрес", callback_data=f"edit_collage_address_{crm_id}")
@@ -3761,18 +4466,22 @@ async def show_collage_data_with_edit_buttons(query, collage_input: CollageInput
 async def handle_collage_field_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, state: str):
     """Обработка редактирования полей коллажа"""
     user_id = update.effective_user.id
-    
-    if text.lower() == 'отмена':
-        user_states[user_id] = 'authenticated'
-        await update.message.reply_text("❌ Редактирование отменено")
-        # Очищаем временные файлы при отмене
-        await cleanup_collage_files(context, user_id)
-        return
-    
+
     # Извлекаем информацию из состояния
     parts = state.split('_')
     field = parts[2]
     crm_id = parts[3]
+
+    # Поддержка старого поведения: если пользователь всё же ввёл 'отмена' текстом,
+    # просто возвращаемся в меню создания коллажа без очистки файлов.
+    if text.lower() == 'отмена':
+        user_states[user_id] = 'authenticated'
+        collage_input = user_collage_inputs.get(user_id)
+        if collage_input:
+            await show_collage_data_with_edit_buttons(update.message, collage_input, crm_id)
+        else:
+            await update.message.reply_text("❌ Данные коллажа не найдены. Начните заново.")
+        return
     
     # Получаем объект коллажа
     collage_input = user_collage_inputs.get(user_id)

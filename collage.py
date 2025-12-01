@@ -25,6 +25,8 @@ class CollageInput:
     mop: str = ''
     agent_phone: str = ''
     action_banner: str = ''
+    # Тип объекта для коллажа: "Квартира" (по умолчанию) или "Коммерческое помещение"
+    object_type: str = 'Квартира'
 
 
 COLLAGE_TEMPLATE = """
@@ -260,13 +262,7 @@ COLLAGE_TEMPLATE = """
     <!-- HERO -->
     <div class="hero">
       <img src="${cover}" alt="cover"/>
-      <div class="rooms-chip">
-        <div class="rooms-num">${rooms}</div>
-        <div class="rooms-text">
-          <div class="line">комнатная</div>
-          <div class="line">квартира</div>
-        </div>
-      </div>
+      ${rooms_chip}
       <div class="price-bubble">${price}</div>
       <div class="meta">
         <!-- <div class="client">${client_name}</div> -->
@@ -331,10 +327,29 @@ def _build_html(ci: CollageInput) -> str:
         for b in ci.benefits
     ])
 
+    # Блок с количеством комнат:
+    # - рендерим только если значение комнат непустое
+    # - для коммерческих объектов ("Коммерческий объект") не показываем вовсе
+    rooms_value = (ci.rooms or '').strip()
+    object_type = (ci.object_type or '').strip()
+    is_commercial = object_type == 'Коммерческий объект'
+
+    if rooms_value and not is_commercial:
+        rooms_chip = f'''
+      <div class="rooms-chip">
+        <div class="rooms-num">{html_escape.escape(rooms_value)}</div>
+        <div class="rooms-text">
+          <div class="line">комнатная</div>
+          <div class="line">квартира</div>
+        </div>
+      </div>'''
+    else:
+        rooms_chip = ''
+
     tpl = Template(COLLAGE_TEMPLATE)
     return tpl.safe_substitute(
         crm_id=ci.crm_id,
-        rooms=html_escape.escape(ci.rooms or '-'),
+        rooms_chip=rooms_chip,
         price=ci.price or '-',
         complex_label=(
             f'<div class="footer-title"><div class="label"><span>{html_escape.escape(ci.complex_name)}</span></div></div>'

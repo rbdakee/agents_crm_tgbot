@@ -412,36 +412,40 @@ class PostgreSQLManager:
             return None
     
     async def search_contracts_by_client_name_lazy(self, client_name: str, agent_name: str, page: int = 1, page_size: int = 10, role: Optional[str] = None) -> Tuple[List[Dict], int]:
-        """Ищет контракты по имени клиента с пагинацией"""
+        """Ищет контракты по имени клиента с пагинацией.
+
+        Поведение:
+        - Для ролей МОП/РОП/ДД — фильтрация по соответствующим полям (mop/rop/dd) и имени владельца.
+        - Для роли ADMIN_VIEW — глобальный поиск по всей базе без ограничения по владельцу (только ACTIVE_STATUS_FILTER).
+        - Для остальных случаев (role is None) — поиск по всем ролям, но в рамках указанного agent_name.
+        """
         try:
             offset = (page - 1) * page_size
             
             async with self.async_session() as session:
-                fio_parts = [p for p in str(agent_name).strip().split() if p]
-                surname = fio_parts[0] if fio_parts else ''
-                name = fio_parts[1] if len(fio_parts) > 1 else ''
-                surname_like = f"%{surname.lower()}%"
-                name_like = f"%{name.lower()}%"
-                if role == 'МОП':
-                    where_clause = "(LOWER(mop) LIKE :surname_like AND LOWER(mop) LIKE :name_like)"
-                elif role == 'РОП':
-                    where_clause = "(LOWER(rop) LIKE :surname_like AND LOWER(rop) LIKE :name_like)"
-                elif role == 'ДД':
-                    where_clause = "(LOWER(dd) LIKE :surname_like AND LOWER(dd) LIKE :name_like)"
-                else:
-                    where_clause = (
-                        "((LOWER(mop) LIKE :surname_like AND LOWER(mop) LIKE :name_like) "
-                        "OR (LOWER(rop) LIKE :surname_like AND LOWER(rop) LIKE :name_like) "
-                        "OR (LOWER(dd)  LIKE :surname_like AND LOWER(dd)  LIKE :name_like))"
-                    )
                 client_like = f"%{client_name}%"
-                def _where(role):
-                    base = func.lower(properties.c.client_name).like(func.lower(client_like))
-                    if role == 'МОП':
+                def _where(role_value: Optional[str]):
+                    base = and_(
+                        func.lower(properties.c.client_name).like(func.lower(client_like)),
+                        ACTIVE_STATUS_FILTER,
+                    )
+
+                    # ADMIN_VIEW — глобальный поиск без ограничения по владельцу
+                    if role_value == 'ADMIN_VIEW':
+                        return base
+
+                    # Для остальных ролей используем ФИО владельца, если оно есть
+                    fio_parts = [p for p in str(agent_name).strip().split() if p]
+                    surname = fio_parts[0] if fio_parts else ''
+                    name = fio_parts[1] if len(fio_parts) > 1 else ''
+                    surname_like = f"%{surname.lower()}%"
+                    name_like = f"%{name.lower()}%"
+
+                    if role_value == 'МОП':
                         return and_(base, func.lower(properties.c.mop).like(surname_like), func.lower(properties.c.mop).like(name_like))
-                    if role == 'РОП':
+                    if role_value == 'РОП':
                         return and_(base, func.lower(properties.c.rop).like(surname_like), func.lower(properties.c.rop).like(name_like))
-                    if role == 'ДД':
+                    if role_value == 'ДД':
                         return and_(base, func.lower(properties.c.dd).like(surname_like), func.lower(properties.c.dd).like(name_like))
                     return and_(
                         base,
@@ -451,6 +455,7 @@ class PostgreSQLManager:
                             and_(func.lower(properties.c.dd).like(surname_like), func.lower(properties.c.dd).like(name_like)),
                         )
                     )
+
                 stmt_count = select(func.count()).select_from(properties).where(_where(role))
                 total_count = (await session.execute(stmt_count)).scalar() or 0
                 stmt_page = (
@@ -1305,6 +1310,132 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"Ошибка get_role_totals({owner_name}, {owner_role}): {e}")
             return {'total': 0, 'cat_A': 0, 'cat_B': 0, 'cat_C': 0}
+
+    async def get_dds_with_counts(self) -> List[Dict[str, Any]]:
+        """Возвращает всех ДД (ФИО + количество объектов). Используется в ADMIN_VIEW."""
+        try:
+            async with self.async_session() as session:
+                res = await session.execute(text(
+                    "SELECT dd AS name, COUNT(*) AS cnt "
+                    "FROM properties "
+                    "WHERE dd IS NOT NULL AND dd <> '' "
+                    "GROUP BY dd "
+                    "ORDER BY cnt DESC NULLS LAST"
+                ))
+                items: List[Dict[str, Any]] = []
+                for row in res.fetchall():
+                    items.append({'name': row.name, 'count': row.cnt})
+                return items
+        except Exception as e:
+            logger.error(f"Ошибка get_dds_with_counts(): {e}")
+            return []
+
+    async def get_dd_contracts_by_category(self, dd_name: str, category: Optional[str] = None) -> List[Dict]:
+        """Получает все объекты конкретного ДД с фильтрацией по категории (для ADMIN_VIEW и меню ДД)."""
+        try:
+            async with self.async_session() as session:
+                fio_parts = [p for p in str(dd_name).strip().split() if p]
+                surname = fio_parts[0] if fio_parts else ''
+                name = fio_parts[1] if len(fio_parts) > 1 else ''
+                surname_like = f"%{surname.lower()}%"
+                name_like = f"%{name.lower()}%"
+
+                where_clause = "(LOWER(dd) LIKE :surname_like AND LOWER(dd) LIKE :name_like)"
+                params = {"surname_like": surname_like, "name_like": name_like}
+
+                if category:
+                    cat_upper = category.upper()
+                    cat_mapping = {'A': 'А', 'B': 'В', 'C': 'С'}
+                    cat_cyr = cat_mapping.get(cat_upper, cat_upper)
+                    where_clause += " AND (UPPER(category) = :cat OR UPPER(category) = :cat_cyr)"
+                    params['cat'] = cat_upper
+                    params['cat_cyr'] = cat_cyr
+
+                status_filter_sql = " AND (status IS NULL OR LOWER(status) != 'реализовано')"
+                result = await session.execute(
+                    text(f"SELECT * FROM properties WHERE {where_clause}{status_filter_sql} ORDER BY last_modified_at DESC"),
+                    params
+                )
+
+                contracts: List[Dict] = []
+                for row in result.fetchall():
+                    contract_dict = dict(row._mapping)
+                    contracts.append(self._convert_to_legacy_format(contract_dict))
+                return contracts
+        except Exception as e:
+            logger.error(f"Ошибка get_dd_contracts_by_category({dd_name}, {category}): {e}")
+            return []
+
+    async def get_all_mops_with_counts(self) -> List[Dict[str, Any]]:
+        """Возвращает всех МОП-ов (ФИО + количество объектов) по всей базе. Используется в ADMIN_VIEW."""
+        try:
+            async with self.async_session() as session:
+                res = await session.execute(text(
+                    "SELECT mop AS name, COUNT(*) AS cnt "
+                    "FROM properties "
+                    "WHERE mop IS NOT NULL AND mop <> '' "
+                    "GROUP BY mop "
+                    "ORDER BY cnt DESC NULLS LAST"
+                ))
+                items: List[Dict[str, Any]] = []
+                for row in res.fetchall():
+                    items.append({'name': row.name, 'count': row.cnt})
+                return items
+        except Exception as e:
+            logger.error(f"Ошибка get_all_mops_with_counts(): {e}")
+            return []
+
+    async def get_global_totals(self) -> Dict[str, int]:
+        """Глобальная статистика по объектам (все ДД/РОП/МОП) для ADMIN_VIEW."""
+        try:
+            async with self.async_session() as session:
+                cond = ACTIVE_STATUS_FILTER
+                total = (await session.execute(
+                    select(func.count()).select_from(properties).where(cond)
+                )).scalar() or 0
+                cat_rows = (await session.execute(
+                    select(properties.c.category, func.count().label('cnt')).where(cond).group_by(properties.c.category)
+                )).fetchall()
+                cats = { (row.category or '').strip().upper(): row.cnt for row in cat_rows }
+                return {
+                    'total': total,
+                    'cat_A': cats.get('А', 0) + cats.get('A', 0),
+                    'cat_B': cats.get('В', 0) + cats.get('B', 0),
+                    'cat_C': cats.get('С', 0) + cats.get('C', 0),
+                }
+        except Exception as e:
+            logger.error(f"Ошибка get_global_totals(): {e}")
+            return {'total': 0, 'cat_A': 0, 'cat_B': 0, 'cat_C': 0}
+
+    async def get_global_contracts_by_category(self, category: Optional[str] = None) -> List[Dict]:
+        """Возвращает объекты по всей базе для ADMIN_VIEW, с опциональной фильтрацией по категории."""
+        try:
+            async with self.async_session() as session:
+                where_clause = "1=1"
+                params: Dict[str, Any] = {}
+                if category:
+                    cat_upper = category.upper()
+                    cat_mapping = {'A': 'А', 'B': 'В', 'C': 'С'}
+                    cat_cyr = cat_mapping.get(cat_upper, cat_upper)
+                    where_clause += " AND (UPPER(category) = :cat OR UPPER(category) = :cat_cyr)"
+                    params['cat'] = cat_upper
+                    params['cat_cyr'] = cat_cyr
+
+                # Применяем фильтр по активным статусам
+                status_filter_sql = " AND (status IS NULL OR LOWER(status) != 'реализовано')"
+                query = text(
+                    f"SELECT * FROM properties WHERE {where_clause}{status_filter_sql} ORDER BY last_modified_at DESC"
+                )
+                result = await session.execute(query, params)
+
+                contracts: List[Dict] = []
+                for row in result.fetchall():
+                    contract_dict = dict(row._mapping)
+                    contracts.append(self._convert_to_legacy_format(contract_dict))
+                return contracts
+        except Exception as e:
+            logger.error(f"Ошибка get_global_contracts_by_category({category}): {e}")
+            return []
 
     async def get_subordinates(self, owner_name: str, owner_role: str, subordinate_role: str) -> List[Dict[str, Any]]:
         """Возвращает подчинённых (имя + количество объектов) для владельца роли.

@@ -157,6 +157,47 @@ async def run_archive_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(worker())
 
 
+async def run_cool_calls_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Админ-команда /cool_calls: выгрузка статистики холодных звонков в Google Sheets.
+    Доступна только пользователю с AUTHORIZED_USER_ID.
+    """
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if user.id != AUTHORIZED_USER_ID:
+        await update.message.reply_text("Команда доступна только авторизованному пользователю.")
+        return
+
+    await update.message.reply_text("📊 Запускаю выгрузку статистики холодных звонков в Google Sheets...")
+
+    async def worker():
+        notice = None
+        try:
+            db_manager = await get_db_manager()
+            notice = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⌛ Формирую статистику по холодным звонкам..."
+            )
+            success = await db_manager.export_cool_calls_stats_to_sheet()
+            if success:
+                await notice.edit_text("✅ Статистика по холодным звонкам успешно выгружена в Google Sheets.")
+            else:
+                await notice.edit_text("❌ Ошибка при выгрузке статистики по холодным звонкам. Проверьте логи сервера.")
+        except Exception as e:
+            logger.error("Ошибка при выгрузке статистики холодных звонков: %s", e, exc_info=True)
+            if notice:
+                await notice.edit_text(f"❌ Ошибка при выгрузке статистики: {e}")
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"❌ Ошибка при выгрузке статистики: {e}"
+                )
+
+    asyncio.create_task(worker())
+
+
 # Role constants and helpers
 ROLE_MOP = 'МОП'
 ROLE_ROP = 'РОП'
@@ -5198,6 +5239,7 @@ def setup_handlers(application: Application):
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("get_new_objects", run_get_new_objects))
     application.add_handler(CommandHandler("archive", run_archive_check))
+    application.add_handler(CommandHandler("cool_calls", run_cool_calls_export))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

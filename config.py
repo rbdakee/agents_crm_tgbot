@@ -29,6 +29,12 @@ FIRST_SHEET_GID = os.getenv('FIRST_SHEET_GID')  # GID первого листа 
 SECOND_SHEET_GID = os.getenv('SECOND_SHEET_GID')  # GID второго листа (SHEET_PROGRESS - можно изменять)
 THIRD_SHEET_GID = os.getenv('THIRD_SHEET_GID')  # GID третьего листа ("Лист8")
 
+# Лист с телефонами агентов (A: ФИО, B: Контакты)
+AGENTS_PHONES_SHEET_GID = os.getenv('AGENTS_PHONES_SHEET_GID')
+
+# Лист для отчета по холодным звонкам (общая и покомпонентная статистика)
+AGENTS_COOL_CALLS_GID = os.getenv('AGENTS_COOL_CALLS_GID')
+
 # PostgreSQL Database
 DATABASE_URL = os.getenv('DATABASE_URL')  # URL подключения к PostgreSQL
 if not DATABASE_URL:

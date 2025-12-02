@@ -1,4 +1,4 @@
-import logging, gspread, os
+import logging, gspread, os, re, asyncio
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from sqlalchemy import text, func, and_, or_, select, update, Table, Column, String, Integer, BigInteger, Boolean, Date, DateTime, MetaData, Float, Text
@@ -6,7 +6,17 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from google.oauth2.service_account import Credentials
-from config import SHEET_ID, THIRD_SHEET_GID, DB_BATCH_SIZE, DB_POOL_SIZE, DB_MAX_OVERFLOW, DB_POOL_RECYCLE
+from config import (
+    SHEET_ID,
+    THIRD_SHEET_GID,
+    DB_BATCH_SIZE,
+    DB_POOL_SIZE,
+    DB_MAX_OVERFLOW,
+    DB_POOL_RECYCLE,
+    AGENTS_PHONES_SHEET_GID,
+    AGENTS_COOL_CALLS_GID,
+    KRISHA_URL_TEMPLATE,
+)
 from api_client import APIClient
 
 logger = logging.getLogger(__name__)
@@ -2454,6 +2464,310 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"Ошибка получения объектов агента: {e}", exc_info=True)
             return [], 0
+
+    async def export_cool_calls_stats_to_sheet(self) -> bool:
+        """
+        Выгружает статистику по холодным звонкам (parsed_properties) в отдельный лист Google Sheets.
+
+        Структура листа (AGENTS_COOL_CALLS_GID):
+        1–2 строки: общая статистика по всем агентам.
+        Далее для каждого агента блок из двух таблиц:
+          - Сводка по агенту (2 строки: заголовок + данные)
+          - Объекты агента (заголовок + список объектов, по одной строке на объект)
+        """
+        try:
+            # Проверяем наличие настроек
+            if not SHEET_ID or not AGENTS_PHONES_SHEET_GID or not AGENTS_COOL_CALLS_GID:
+                raise ValueError("SHEET_ID, AGENTS_PHONES_SHEET_GID или AGENTS_COOL_CALLS_GID не установлены")
+
+            credentials_file = 'credentials.json'
+            if not os.path.exists(credentials_file):
+                raise ValueError(f"Файл {credentials_file} не найден")
+
+            # Инициализируем Google Sheets (через отдельный поток, чтобы не блокировать event loop)
+            credentials = Credentials.from_service_account_file(
+                credentials_file,
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
+            gc = gspread.authorize(credentials)
+            spreadsheet = await asyncio.to_thread(gc.open_by_key, SHEET_ID)
+            agents_ws = await asyncio.to_thread(spreadsheet.get_worksheet_by_id, int(AGENTS_PHONES_SHEET_GID))
+            stats_ws = await asyncio.to_thread(spreadsheet.get_worksheet_by_id, int(AGENTS_COOL_CALLS_GID))
+
+            # Строим карту телефон (10 цифр) -> ФИО из листа AGENTS_PHONES_SHEET_GID
+            phone_to_name: Dict[str, str] = {}
+            agents_rows = await asyncio.to_thread(agents_ws.get_all_values) or []
+            # Ожидается: A: ФИО, B: Контакты; первая строка — заголовки
+            for idx, row in enumerate(agents_rows[1:], start=2):
+                if not row or len(row) < 2:
+                    continue
+                name = (row[0] or "").strip()
+                phones_raw = (row[1] or "").strip()
+                if not name or not phones_raw:
+                    continue
+                # Убираем всё, кроме цифр и берём последние 10 символов для нормализации
+                digits = re.sub(r"\\D", "", phones_raw)
+                if not digits:
+                    continue
+                if len(digits) >= 10:
+                    tail10 = digits[-10:]
+                    # Первое совпадение считаем основным ФИО
+                    phone_to_name.setdefault(tail10, name)
+
+            async with self.async_session() as session:
+                # Общая статистика:
+                # - total_in_db: все объекты с krisha_id (независимо от stats_agent_given)
+                # - total_taken и статусы: только объекты, у которых stats_agent_given IS NOT NULL
+                overall_sql = text(
+                    """
+                    SELECT 
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '') AS total_in_db,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL) AS total_taken,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Не позвонили') AS not_called,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Перезвонить')  AS recall,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Встреча')      AS meeting,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Договор')      AS deal,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Отказ')        AS rejected,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Архив')        AS archived
+                    FROM parsed_properties
+                    """
+                )
+                overall_result = await session.execute(overall_sql)
+                overall_row = overall_result.fetchone()
+
+                agents_count_sql = text(
+                    """
+                    SELECT COUNT(DISTINCT stats_agent_given) AS agents_count
+                    FROM parsed_properties
+                    WHERE stats_agent_given IS NOT NULL
+                      AND krisha_id IS NOT NULL AND krisha_id != ''
+                    """
+                )
+                agents_count_result = await session.execute(agents_count_sql)
+                agents_count_row = agents_count_result.fetchone()
+
+                # Статистика по каждому агенту
+                per_agent_sql = text(
+                    """
+                    SELECT 
+                        stats_agent_given,
+                        COUNT(*) AS total,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Не позвонили') AS not_called,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Перезвонить')  AS recall,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Встреча')      AS meeting,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Договор')      AS deal,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Отказ')        AS rejected,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Архив')        AS archived
+                    FROM parsed_properties
+                    WHERE stats_agent_given IS NOT NULL
+                      AND krisha_id IS NOT NULL AND krisha_id != ''
+                    GROUP BY stats_agent_given
+                    ORDER BY stats_agent_given
+                    """
+                )
+                per_agent_result = await session.execute(per_agent_sql)
+                per_agent_rows = per_agent_result.fetchall()
+
+                # Готовим данные для записи в лист
+                values: List[List[Any]] = []
+                empty_row_indices: List[int] = []  # Индексы пустых строк (1-based для Google Sheets)
+
+                # 1–2 строки: общая статистика
+                values.append([
+                    "Количество агентов",
+                    "Всего объектов в базе",
+                    "Всего объектов взято",
+                    "Не позвонили",
+                    "Перезвонить",
+                    "Встреча",
+                    "Договор",
+                    "Отказ",
+                    "Архив",
+                ])
+                if overall_row:
+                    values.append([
+                        (agents_count_row.agents_count if agents_count_row and agents_count_row.agents_count is not None else 0),
+                        overall_row.total_in_db or 0,
+                        overall_row.total_taken or 0,
+                        overall_row.not_called or 0,
+                        overall_row.recall or 0,
+                        overall_row.meeting or 0,
+                        overall_row.deal or 0,
+                        overall_row.rejected or 0,
+                        overall_row.archived or 0,
+                    ])
+                else:
+                    values.append([
+                        (agents_count_row.agents_count if agents_count_row else 0),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ])
+
+                # Далее блоки по каждому агенту
+                for agent_stats in per_agent_rows:
+                    phone = agent_stats.stats_agent_given or ""
+                    name = phone_to_name.get(phone, "")
+
+                    # Таблица-итог по агенту (2 строки)
+                    # Запоминаем индекс пустой строки (1-based: текущая длина + 1)
+                    empty_row_indices.append(len(values) + 1)
+                    values.append([])  # Пустая строка как разделитель блоков
+                    values.append([
+                        "Телефон агента",
+                        "ФИО",
+                        "Всего объектов",
+                        "Не позвонили",
+                        "Перезвонить",
+                        "Встреча",
+                        "Договор",
+                        "Отказ",
+                        "Архив",
+                    ])
+                    values.append([
+                        phone,
+                        name,
+                        agent_stats.total or 0,
+                        agent_stats.not_called or 0,
+                        agent_stats.recall or 0,
+                        agent_stats.meeting or 0,
+                        agent_stats.deal or 0,
+                        agent_stats.rejected or 0,
+                        agent_stats.archived or 0,
+                    ])
+
+                    # Заголовок для объектов агента
+                    values.append([
+                        "vitrina ID",
+                        "Адрес",
+                        "ЖК",
+                        "Класс",
+                        "Цена",
+                        "Контакты",
+                        "Площадь",
+                        "Категория",
+                        "krishakz",
+                        "Статус",
+                        "Комментарии",
+                        "Время получения",
+                    ])
+
+                    # Объекты агента
+                    agent_objects_sql = text(
+                        """
+                        SELECT 
+                            vitrina_id,
+                            address,
+                            complex,
+                            property_class,
+                            sell_price,
+                            phones,
+                            area,
+                            stats_object_category,
+                            krisha_id,
+                            stats_object_status,
+                            stats_description,
+                            stats_time_given
+                        FROM parsed_properties
+                        WHERE stats_agent_given = :phone
+                          AND krisha_id IS NOT NULL AND krisha_id != ''
+                        ORDER BY vitrina_id
+                        """
+                    )
+                    agent_objects_result = await session.execute(agent_objects_sql, {"phone": phone})
+                    for obj in agent_objects_result.fetchall():
+                        krisha_id = obj.krisha_id or ""
+                        krisha_url = KRISHA_URL_TEMPLATE.format(krisha_id=krisha_id) if krisha_id else ""
+                        # Приводим время назначения к строке в формате ДД.ММ.ГГГГ ЧЧ:ММ
+                        time_given_val = obj.stats_time_given
+                        if isinstance(time_given_val, datetime):
+                            try:
+                                time_given_str = time_given_val.strftime("%d.%m.%Y %H:%M")
+                            except Exception:
+                                time_given_str = str(time_given_val)
+                        elif time_given_val is None:
+                            time_given_str = ""
+                        else:
+                            time_given_str = str(time_given_val)
+
+                        # Телефоны: защищаем от интерпретации как формулы (+7... +7...) в Google Sheets
+                        raw_phones = obj.phones or ""
+                        phones_cell = f"'{raw_phones}" if raw_phones else ""
+
+                        values.append([
+                            obj.vitrina_id,
+                            obj.address or "",
+                            obj.complex or "",
+                            obj.property_class or "",
+                            obj.sell_price or 0,
+                            phones_cell,
+                            obj.area or 0,
+                            obj.stats_object_category or "",
+                            krisha_url,
+                            obj.stats_object_status or "",
+                            obj.stats_description or "",
+                            time_given_str,
+                        ])
+
+            # Полностью перезаписываем лист статистики (через to_thread, чтобы не блокировать event loop)
+            await asyncio.to_thread(stats_ws.clear)
+            if values:
+                await asyncio.to_thread(stats_ws.update, 'A1', values, value_input_option='USER_ENTERED')
+                
+                # Форматируем пустые строки-разделители: заливка "dark grey 2" (RGB: 217, 217, 217)
+                if empty_row_indices:
+                    sheet_id = stats_ws.id
+                    requests = []
+                    for row_idx in empty_row_indices:
+                        # Форматируем всю строку (колонки A-Z, чтобы покрыть все возможные данные)
+                        requests.append({
+                            'repeatCell': {
+                                'range': {
+                                    'sheetId': sheet_id,
+                                    'startRowIndex': row_idx - 1,  # 0-based индекс
+                                    'endRowIndex': row_idx,  # 0-based, не включая
+                                    'startColumnIndex': 0,
+                                    'endColumnIndex': 26  # A-Z (26 колонок)
+                                },
+                                'cell': {
+                                    'userEnteredFormat': {
+                                        'backgroundColor': {
+                                            'red': 217.0 / 255.0,
+                                            'green': 217.0 / 255.0,
+                                            'blue': 217.0 / 255.0
+                                        }
+                                    }
+                                },
+                                'fields': 'userEnteredFormat.backgroundColor'
+                            }
+                        })
+                    
+                    if requests:
+                        await asyncio.to_thread(spreadsheet.batch_update, {'requests': requests})
+
+            logger.info("Статистика по холодным звонкам успешно выгружена в Google Sheets")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка выгрузки статистики по холодным звонкам в Google Sheets: {e}", exc_info=True)
+            return False
 
     async def _load_third_map(self) -> Dict[str, Dict[str, Optional[float]]]:
         """Загружает third_map из Google Sheets с кешированием"""

@@ -100,6 +100,52 @@ async def run_auto_tasks_scheduler(application: Application):
             logging.error(f"Ошибка в планировщике автоматических задач: {e}", exc_info=True)
             await asyncio.sleep(60)  # Продолжаем работу даже при ошибке
 
+
+async def run_cool_calls_scheduler():
+    """
+    Фоновая задача для автоматического запуска экспортa статистики холодных звонков
+    в Google Sheets дважды в день: в 10:00 и 22:00 по времени Asia/Almaty.
+
+    Работает в отдельной задаче и не блокирует основной asyncio.run(main()).
+    """
+    almaty_tz = ZoneInfo("Asia/Almaty")
+
+    target_times = [time(10, 0), time(22, 0)]
+    last_run_dates = {t: None for t in target_times}
+
+    while True:
+        try:
+            now_almaty = datetime.now(almaty_tz)
+            current_time = now_almaty.time()
+            current_date = now_almaty.date()
+
+            for t in target_times:
+                if (
+                    current_time.hour == t.hour
+                    and current_time.minute == t.minute
+                    and last_run_dates[t] != current_date
+                ):
+                    last_run_dates[t] = current_date
+                    logging.info(f"Запуск автоматического экспорта cool_calls в {t.strftime('%H:%M')} (Asia/Almaty)")
+                    try:
+                        db_manager = await get_db_manager()
+                        success = await db_manager.export_cool_calls_stats_to_sheet()
+                        if success:
+                            logging.info("Автоматический экспорт cool_calls успешно завершён")
+                        else:
+                            logging.error("Автоматический экспорт cool_calls завершился с ошибкой (success=False)")
+                    except Exception as e:
+                        logging.error(f"Ошибка при автоматическом экспорте cool_calls: {e}", exc_info=True)
+
+            # Проверяем каждую минуту
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            logging.info("Планировщик cool_calls остановлен")
+            break
+        except Exception as e:
+            logging.error(f"Ошибка в планировщике cool_calls: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
 async def main():
     setup_logging()
     
@@ -191,6 +237,10 @@ async def main():
         auto_tasks_task = asyncio.create_task(run_auto_tasks_scheduler(application))
         logging.info(f"Запущена фоновая задача автоматических задач (время запуска: {AUTO_TASKS_TIME})")
 
+        # Запускаем фоновую задачу для автоматического экспорта cool_calls (2 раза в день)
+        cool_calls_task = asyncio.create_task(run_cool_calls_scheduler())
+        logging.info("Запущена фоновая задача автоматического экспорта cool_calls (10:00 и 22:00 Asia/Almaty)")
+
         if USE_WEBHOOK and WEBHOOK_URL:
             logging.info(f"Бот запущен в режиме вебхука на {WEBAPP_HOST}:{WEBAPP_PORT}")
             # Единый async-путь запуска (без blocking run_webhook). Используем updater.start_webhook
@@ -242,6 +292,8 @@ async def main():
             recall_notifications_task.cancel()
         if 'auto_tasks_task' in locals():
             auto_tasks_task.cancel()
+        if 'cool_calls_task' in locals():
+            cool_calls_task.cancel()
         try:
             db_manager = await get_db_manager()
             await db_manager.close()

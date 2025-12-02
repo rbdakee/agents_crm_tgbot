@@ -171,3 +171,23 @@ WHERE category IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_properties_modified_at 
 ON properties(last_modified_at DESC);
+
+-- Индекс для фильтрации по property_class в parsed_properties
+CREATE INDEX IF NOT EXISTS idx_parsed_properties_property_class 
+ON parsed_properties(property_class) 
+WHERE property_class IS NOT NULL;
+
+-- Таблица агентов витрины: ФИО, телефон, chat_ids (массив TEXT), роль и настройки фильтров
+CREATE TABLE IF NOT EXISTS vitrina_agents (
+    agent_phone VARCHAR(255) PRIMARY KEY,
+    full_name TEXT,
+    chat_ids TEXT[],  -- Массив chat_id: {'123456', '789012', ...} (поддержка отрицательных и начинающихся с нуля)
+    role VARCHAR(50),
+    property_classes TEXT[],
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Индекс для поиска по chat_id в массиве
+CREATE INDEX IF NOT EXISTS idx_vitrina_agents_chat_ids 
+ON vitrina_agents USING GIN (chat_ids);

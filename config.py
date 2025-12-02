@@ -1,4 +1,5 @@
 import os
+from typing import List
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -173,3 +174,24 @@ SUPPORT_URL = f"https://t.me/{SUPPORT_USERNAME}"
 
 # Настройки автоматических задач (время в формате HH:MM, часовой пояс Asia/Almaty)
 AUTO_TASKS_TIME = os.getenv('AUTO_TASKS_TIME', '02:00')  # Время запуска автоматических задач (get_new_objects и archive)
+
+# Список классов недвижимости (динамически загружается из БД)
+PROPERTY_CLASSES: List[str] = []
+
+async def refresh_property_classes():
+    """Обновляет список классов недвижимости из БД"""
+    global PROPERTY_CLASSES
+    try:
+        # Импортируем здесь, чтобы избежать циклических зависимостей
+        from database_postgres import get_db_manager
+        import logging
+        
+        db_manager = await get_db_manager()
+        classes = await db_manager.get_distinct_property_classes()
+        PROPERTY_CLASSES = classes
+        logging.info(f"Загружены классы недвижимости: {PROPERTY_CLASSES}")
+    except Exception as e:
+        import logging
+        logging.error(f"Ошибка загрузки классов недвижимости: {e}")
+        # Fallback на дефолтный список
+        PROPERTY_CLASSES = ['Эконом', 'Комфорт lite', 'Комфорт+', 'Бизнес', 'Бизнес+', 'Премиум', 'Элит']

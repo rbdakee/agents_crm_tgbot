@@ -318,6 +318,81 @@ class PostgreSQLManager:
                     logger.info("Колонка stats_object_category успешно добавлена в parsed_properties")
                 else:
                     logger.info("Колонка stats_object_category уже существует в parsed_properties")
+                
+                # Создаем таблицу vitrina_agents, если её нет
+                agents_table_check = await session.execute(text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'vitrina_agents'
+                    )
+                """))
+                agents_table_exists = agents_table_check.scalar()
+
+                if not agents_table_exists:
+                    logger.info("Таблица vitrina_agents не найдена — создаю...")
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS vitrina_agents (
+                            agent_phone VARCHAR(255) PRIMARY KEY,
+                            full_name TEXT,
+                            chat_ids TEXT[],
+                            role VARCHAR(50),
+                            property_classes TEXT[],
+                            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """))
+                    await session.execute(text("""
+                        CREATE INDEX IF NOT EXISTS idx_vitrina_agents_chat_ids 
+                        ON vitrina_agents USING GIN (chat_ids)
+                    """))
+                    await session.commit()
+                    logger.info("Таблица vitrina_agents создана вместе с индексами")
+                else:
+                    logger.info("Таблица vitrina_agents уже существует")
+                    # Безопасно добавляем недостающие колонки, если их нет
+                    columns_check = await session.execute(text("""
+                        SELECT column_name 
+                        FROM information_schema.columns
+                        WHERE table_name = 'vitrina_agents'
+                    """))
+                    existing_columns = {row.column_name for row in columns_check.fetchall()}
+                    
+                    # Добавляем chat_ids, если его нет (миграция со старой структуры)
+                    if 'chat_ids' not in existing_columns:
+                        logger.info("Добавляю колонку chat_ids в vitrina_agents...")
+                        await session.execute(text("""
+                            ALTER TABLE vitrina_agents 
+                            ADD COLUMN IF NOT EXISTS chat_ids TEXT[]
+                        """))
+                        await session.commit()
+                        logger.info("Колонка chat_ids добавлена в vitrina_agents")
+                    
+                    # Добавляем role, если его нет
+                    if 'role' not in existing_columns:
+                        logger.info("Добавляю колонку role в vitrina_agents...")
+                        await session.execute(text("""
+                            ALTER TABLE vitrina_agents 
+                            ADD COLUMN IF NOT EXISTS role VARCHAR(50)
+                        """))
+                        await session.commit()
+                        logger.info("Колонка role добавлена в vitrina_agents")
+                    
+                    # Создаем индекс, если его нет
+                    index_check = await session.execute(text("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM pg_indexes 
+                            WHERE tablename = 'vitrina_agents' 
+                            AND indexname = 'idx_vitrina_agents_chat_ids'
+                        )
+                    """))
+                    if not index_check.scalar():
+                        logger.info("Создаю индекс idx_vitrina_agents_chat_ids...")
+                        await session.execute(text("""
+                            CREATE INDEX IF NOT EXISTS idx_vitrina_agents_chat_ids 
+                            ON vitrina_agents USING GIN (chat_ids)
+                        """))
+                        await session.commit()
+                        logger.info("Индекс idx_vitrina_agents_chat_ids создан")
 
         except Exception as e:
             logger.error(f"Ошибка ensure_parsed_properties_schema: {e}", exc_info=True)
@@ -2249,11 +2324,24 @@ class PostgreSQLManager:
             logger.error(f"Ошибка взятия объекта {vitrina_id}: {e}", exc_info=True)
             return False
 
-    async def assign_latest_parsed_properties(self, agent_phone: str, limit: int = 10) -> Tuple[int, List[int], Dict[str, List[int]]]:
+    async def assign_latest_parsed_properties(
+        self, 
+        agent_phone: str, 
+        limit: int = 10,
+        property_classes_filter: Optional[List[str]] = None
+    ) -> Tuple[int, List[int], Dict[str, List[int]]]:
         """Назначает агенту несколько последних свободных объектов с распределением по категориям.
         
-        Возвращает: (количество добавленных, список всех ID, словарь {категория: [id, ...]})
+        Args:
+            agent_phone: Телефон агента
+            limit: Общий лимит объектов (по умолчанию 10)
+            property_classes_filter: Список классов для фильтрации (если None - без фильтра)
+        
+        Returns:
+            (количество добавленных, список всех ID, словарь {категория: [id, ...]})
+        
         Распределение: 3-A, 3-B, 4-C. Если не хватает A, увеличивается B. Если не хватает B, увеличивается C.
+        Если задан фильтр по классам, сначала ищутся объекты с фильтром, затем добираются без фильтра до нужного количества.
         """
         try:
             # Целевое распределение: 3-A, 3-B, 4-C
@@ -2262,56 +2350,101 @@ class PostgreSQLManager:
             target_c = 4
             
             async with self.async_session() as session:
+                # Функция для получения объектов категории с фильтром
+                async def get_objects_with_filter(category: str, limit_count: int, exclude_ids: List[int], use_filter: bool) -> List[int]:
+                    """Получает объекты категории с опциональным фильтром по классам"""
+                    base_where = """
+                        WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                          AND stats_agent_given IS NULL
+                          AND stats_object_category = :category
+                    """
+                    
+                    # Если категория C, также включаем NULL
+                    if category == 'C':
+                        base_where = """
+                            WHERE krisha_id IS NOT NULL AND krisha_id != ''
+                              AND stats_agent_given IS NULL
+                              AND (stats_object_category = 'C' OR stats_object_category IS NULL)
+                        """
+                    
+                    # Добавляем фильтр по классам, если задан
+                    filter_clause = ""
+                    params = {"category": category, "limit": limit_count}
+                    
+                    if use_filter and property_classes_filter:
+                        filter_clause = " AND property_class = ANY(:classes)"
+                        params["classes"] = property_classes_filter
+                    
+                    # Исключаем уже выбранные объекты
+                    exclude_clause = ""
+                    if exclude_ids:
+                        exclude_clause = " AND vitrina_id != ALL(:exclude_ids)"
+                        params["exclude_ids"] = exclude_ids
+                    
+                    query = f"""
+                        SELECT vitrina_id
+                        FROM parsed_properties
+                        {base_where}
+                        {filter_clause}
+                        {exclude_clause}
+                        ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
+                        LIMIT :limit
+                        FOR UPDATE SKIP LOCKED
+                    """
+                    
+                    result = await session.execute(text(query), params)
+                    return [row.vitrina_id for row in result.fetchall()]
+                
                 # Получаем объекты категории A
-                result_a = await session.execute(text("""
-                    SELECT vitrina_id, stats_object_category
-                    FROM parsed_properties
-                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
-                      AND stats_agent_given IS NULL
-                      AND stats_object_category = 'A'
-                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
-                    LIMIT :limit
-                    FOR UPDATE SKIP LOCKED
-                """), {"limit": target_a})
-                rows_a = result_a.fetchall()
-                ids_a = [row.vitrina_id for row in rows_a]
+                ids_a_filtered = []
+                if property_classes_filter:
+                    ids_a_filtered = await get_objects_with_filter('A', target_a, [], True)
+                
+                # Добираем A без фильтра, если не хватило
+                needed_a = target_a - len(ids_a_filtered)
+                ids_a_additional = []
+                if needed_a > 0:
+                    ids_a_additional = await get_objects_with_filter('A', needed_a, ids_a_filtered, False)
+                
+                ids_a = ids_a_filtered + ids_a_additional
                 
                 # Вычисляем сколько нужно B (увеличиваем, если не хватило A, но не больше общего лимита)
                 missing_a = target_a - len(ids_a)
                 needed_b = min(limit - len(ids_a), target_b + missing_a)
-                needed_b = max(0, needed_b)  # Не может быть отрицательным
+                needed_b = max(0, needed_b)
                 
                 # Получаем объекты категории B
-                result_b = await session.execute(text("""
-                    SELECT vitrina_id, stats_object_category
-                    FROM parsed_properties
-                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
-                      AND stats_agent_given IS NULL
-                      AND stats_object_category = 'B'
-                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
-                    LIMIT :limit
-                    FOR UPDATE SKIP LOCKED
-                """), {"limit": needed_b})
-                rows_b = result_b.fetchall()
-                ids_b = [row.vitrina_id for row in rows_b]
+                ids_b_filtered = []
+                if property_classes_filter:
+                    ids_b_filtered = await get_objects_with_filter('B', needed_b, ids_a, True)
+                
+                # Добираем B без фильтра, если не хватило
+                needed_b_additional = needed_b - len(ids_b_filtered)
+                ids_b_additional = []
+                if needed_b_additional > 0:
+                    exclude_b = ids_a + ids_b_filtered
+                    ids_b_additional = await get_objects_with_filter('B', needed_b_additional, exclude_b, False)
+                
+                ids_b = ids_b_filtered + ids_b_additional
                 
                 # Вычисляем сколько нужно C (остальное до общего лимита)
                 needed_c = limit - len(ids_a) - len(ids_b)
-                needed_c = max(0, needed_c)  # Не может быть отрицательным
+                needed_c = max(0, needed_c)
                 
                 # Получаем объекты категории C
-                result_c = await session.execute(text("""
-                    SELECT vitrina_id, stats_object_category
-                    FROM parsed_properties
-                    WHERE krisha_id IS NOT NULL AND krisha_id != ''
-                      AND stats_agent_given IS NULL
-                      AND (stats_object_category = 'C' OR stats_object_category IS NULL)
-                    ORDER BY krisha_date DESC NULLS LAST, vitrina_id DESC
-                    LIMIT :limit
-                    FOR UPDATE SKIP LOCKED
-                """), {"limit": needed_c})
-                rows_c = result_c.fetchall()
-                ids_c = [row.vitrina_id for row in rows_c]
+                ids_c_filtered = []
+                if property_classes_filter:
+                    exclude_c = ids_a + ids_b
+                    ids_c_filtered = await get_objects_with_filter('C', needed_c, exclude_c, True)
+                
+                # Добираем C без фильтра, если не хватило
+                needed_c_additional = needed_c - len(ids_c_filtered)
+                ids_c_additional = []
+                if needed_c_additional > 0:
+                    exclude_c_all = ids_a + ids_b + ids_c_filtered
+                    ids_c_additional = await get_objects_with_filter('C', needed_c_additional, exclude_c_all, False)
+                
+                ids_c = ids_c_filtered + ids_c_additional
                 
                 # Объединяем все ID
                 all_ids = ids_a + ids_b + ids_c
@@ -2377,6 +2510,188 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"Ошибка получения статистики по статусам: {e}", exc_info=True)
             return {"total": 0, "not_called": 0, "recall": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
+
+    async def get_distinct_property_classes(self) -> List[str]:
+        """Получает список уникальных классов недвижимости из БД (исключая NULL)"""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT DISTINCT property_class
+                    FROM parsed_properties
+                    WHERE property_class IS NOT NULL
+                    ORDER BY property_class
+                """))
+                classes = [row.property_class for row in result.fetchall()]
+                return classes
+        except Exception as e:
+            logger.error(f"Ошибка получения списка классов: {e}", exc_info=True)
+            return []
+
+    async def upsert_vitrina_agent(
+        self,
+        agent_phone: str,
+        full_name: Optional[str] = None,
+        chat_id: Optional[int] = None,
+        role: Optional[str] = None,
+    ) -> None:
+        """Создает/обновляет запись агента (ФИО, телефон, добавляет chat_id в массив, роль)."""
+        try:
+            async with self.async_session() as session:
+                if chat_id is not None:
+                    # Получаем текущий список chat_ids
+                    result = await session.execute(text("""
+                        SELECT chat_ids FROM vitrina_agents WHERE agent_phone = :phone
+                    """), {"phone": agent_phone})
+                    row = result.fetchone()
+                    
+                    # Получаем существующий массив или создаем новый
+                    if row and row.chat_ids:
+                        chat_ids_list = list(row.chat_ids) if row.chat_ids else []
+                    else:
+                        chat_ids_list = []
+                    
+                    # Добавляем chat_id как строку, если его еще нет
+                    chat_id_str = str(chat_id)
+                    if chat_id_str not in chat_ids_list:
+                        chat_ids_list.append(chat_id_str)
+                    
+                    chat_ids_array = chat_ids_list
+                else:
+                    # Если chat_id не передан, получаем текущий или оставляем NULL
+                    result = await session.execute(text("""
+                        SELECT chat_ids FROM vitrina_agents WHERE agent_phone = :phone
+                    """), {"phone": agent_phone})
+                    row = result.fetchone()
+                    chat_ids_array = list(row.chat_ids) if row and row.chat_ids else None
+                
+                await session.execute(text("""
+                    INSERT INTO vitrina_agents (agent_phone, full_name, chat_ids, role, created_at, updated_at)
+                    VALUES (:phone, :full_name, :chat_ids, :role, NOW() AT TIME ZONE 'Asia/Almaty', NOW() AT TIME ZONE 'Asia/Almaty')
+                    ON CONFLICT (agent_phone)
+                    DO UPDATE SET
+                        full_name = COALESCE(:full_name, vitrina_agents.full_name),
+                        chat_ids = COALESCE(:chat_ids, vitrina_agents.chat_ids),
+                        role = COALESCE(:role, vitrina_agents.role),
+                        updated_at = NOW() AT TIME ZONE 'Asia/Almaty'
+                """), {
+                    "phone": agent_phone,
+                    "full_name": full_name,
+                    "chat_ids": chat_ids_array,
+                    "role": role,
+                })
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка upsert vitrina_agent {agent_phone}: {e}", exc_info=True)
+            raise
+
+    async def get_vitrina_agent_by_chat_id(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        """Возвращает агента по chat_id (ищет в массиве chat_ids)."""
+        try:
+            async with self.async_session() as session:
+                # Ищем агента, у которого chat_id есть в массиве chat_ids
+                # Конвертируем chat_id в строку для поиска в TEXT[]
+                result = await session.execute(text("""
+                    SELECT agent_phone, full_name, chat_ids, role, property_classes
+                    FROM vitrina_agents
+                    WHERE chat_ids IS NOT NULL
+                      AND :chat_id_str = ANY(chat_ids)
+                """), {"chat_id_str": str(chat_id)})
+                row = result.fetchone()
+                if not row:
+                    return None
+                
+                return {
+                    "agent_phone": row.agent_phone,
+                    "full_name": row.full_name,
+                    "chat_ids": list(row.chat_ids) if row.chat_ids else [],
+                    "role": row.role,
+                    "property_classes": list(row.property_classes) if row.property_classes else None,
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения vitrina_agent по chat_id {chat_id}: {e}", exc_info=True)
+            return None
+
+    async def clear_vitrina_agent_chat_id(self, agent_phone: str, chat_id: int) -> None:
+        """Удаляет конкретный chat_id из массива chat_ids агента (при логауте с одного устройства)."""
+        try:
+            async with self.async_session() as session:
+                # Используем функцию array_remove для удаления элемента из массива
+                # Конвертируем chat_id в строку для работы с TEXT[]
+                await session.execute(text("""
+                    UPDATE vitrina_agents
+                    SET chat_ids = array_remove(chat_ids, :chat_id_str),
+                        updated_at = NOW() AT TIME ZONE 'Asia/Almaty'
+                    WHERE agent_phone = :phone
+                      AND :chat_id_str = ANY(chat_ids)
+                """), {"phone": agent_phone, "chat_id_str": str(chat_id)})
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка удаления chat_id {chat_id} для {agent_phone}: {e}", exc_info=True)
+            raise
+
+    async def update_vitrina_agent_role(self, agent_phone: str, role: Optional[str]) -> None:
+        """Обновляет роль агента в vitrina_agents."""
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("""
+                    UPDATE vitrina_agents
+                    SET role = :role,
+                        updated_at = NOW() AT TIME ZONE 'Asia/Almaty'
+                    WHERE agent_phone = :phone
+                """), {"phone": agent_phone, "role": role})
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка обновления роли для {agent_phone}: {e}", exc_info=True)
+            raise
+
+    async def get_agent_filter_settings(self, agent_phone: str) -> Optional[List[str]]:
+        """Получает настройки фильтров агента по классам из vitrina_agents."""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(text("""
+                    SELECT property_classes
+                    FROM vitrina_agents
+                    WHERE agent_phone = :phone
+                """), {"phone": agent_phone})
+                row = result.fetchone()
+                if row and row.property_classes:
+                    return list(row.property_classes)
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка получения настроек фильтров для {agent_phone}: {e}", exc_info=True)
+            return None
+
+    async def save_agent_filter_settings(self, agent_phone: str, property_classes: List[str]) -> None:
+        """Сохраняет настройки фильтров агента в vitrina_agents."""
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("""
+                    INSERT INTO vitrina_agents (agent_phone, property_classes, updated_at)
+                    VALUES (:phone, :classes, NOW() AT TIME ZONE 'Asia/Almaty')
+                    ON CONFLICT (agent_phone) 
+                    DO UPDATE SET 
+                        property_classes = :classes,
+                        updated_at = NOW() AT TIME ZONE 'Asia/Almaty'
+                """), {"phone": agent_phone, "classes": property_classes})
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек фильтров для {agent_phone}: {e}", exc_info=True)
+            raise
+
+    async def clear_agent_filter_settings(self, agent_phone: str) -> None:
+        """Очищает настройки фильтров агента в vitrina_agents (не удаляя запись)."""
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("""
+                    UPDATE vitrina_agents
+                    SET property_classes = NULL,
+                        updated_at = NOW() AT TIME ZONE 'Asia/Almaty'
+                    WHERE agent_phone = :phone
+                """), {"phone": agent_phone})
+                await session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка очистки настроек фильтров для {agent_phone}: {e}", exc_info=True)
+            raise
 
     async def get_my_new_parsed_properties(
         self, 

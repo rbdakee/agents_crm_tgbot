@@ -509,6 +509,26 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    # Авто-логин по chat.id после перезапуска бота:
+    # если пользователь еще не аутентифицирован в сессии, но ранее логинился,
+    # подтягиваем его данные из vitrina_agents.
+    if user_states.get(user_id) != 'authenticated' or not context.user_data.get('agent_name'):
+        try:
+            db_manager = await get_db_manager()
+            agent_info = await db_manager.get_vitrina_agent_by_chat_id(user_id)
+        except Exception as e:
+            logger.error(f"Ошибка авто-логина по chat_id {user_id}: {e}", exc_info=True)
+            agent_info = None
+
+        if agent_info:
+            context.user_data['agent_name'] = agent_info.get('full_name')
+            context.user_data['phone'] = agent_info.get('agent_phone')
+            # Восстанавливаем роль из БД
+            role = agent_info.get('role')
+            if role:
+                set_user_role(context, role)
+            user_states[user_id] = 'authenticated'
+
     if context.args and context.args[0].startswith('crm_'):
         crm_id = context.args[0].replace('crm_', '')
 
@@ -582,6 +602,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    agent_phone = context.user_data.get('phone')
+    
+    # Удаляем chat_id из массива в БД при логауте
+    if agent_phone:
+        try:
+            db_manager = await get_db_manager()
+            await db_manager.clear_vitrina_agent_chat_id(agent_phone, user_id)
+        except Exception as e:
+            logger.error(f"Ошибка удаления chat_id при логауте для {agent_phone}: {e}", exc_info=True)
+    
     user_states[user_id] = 'waiting_phone'
     context.user_data.clear()
     await update.message.reply_text(
@@ -1053,6 +1083,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         role = data.replace("select_role_", "")
         if role in {ROLE_MOP, ROLE_ROP, ROLE_DD}:
             set_user_role(context, role)
+            
+            # Сохраняем роль в БД
+            agent_phone = context.user_data.get('phone')
+            if agent_phone:
+                try:
+                    db_manager = await get_db_manager()
+                    await db_manager.update_vitrina_agent_role(agent_phone, role)
+                except Exception as e:
+                    logger.error(f"Ошибка сохранения роли для {agent_phone}: {e}", exc_info=True)
+            
             if role == ROLE_DD:
                 # Сохраняем имя для поиска в колонке dd по номеру телефона
                 phone = context.user_data.get('phone')
@@ -1770,6 +1810,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "add_bulk_objects":
         await handle_add_bulk_objects(update, context)
     
+    elif data == "configure_bulk_filter":
+        await show_configure_bulk_filter(update, context)
+    
+    elif data.startswith("toggle_property_class_"):
+        await handle_toggle_property_class(update, context)
+    
+    elif data == "clear_property_classes":
+        await handle_clear_property_classes(update, context)
+    
+    elif data == "back_from_filter_config":
+        await show_bulk_objects_filter_menu(update, context)
+    
+    elif data == "add_bulk_objects_confirm":
+        await handle_add_bulk_objects_confirm(update, context)
+    
     elif data == "find_objects":
         await show_find_objects(update, context, page=1)
     
@@ -2004,6 +2059,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "logout_yes":
         # Выход из системы
         user_id = update.effective_user.id
+        agent_phone = context.user_data.get('phone')
+
+        # Удаляем chat_id из массива в БД при логауте через inline-кнопку
+        if agent_phone:
+            try:
+                db_manager = await get_db_manager()
+                await db_manager.clear_vitrina_agent_chat_id(agent_phone, user_id)
+            except Exception as e:
+                logger.error(f"Ошибка удаления chat_id при логауте (callback) для {agent_phone}: {e}", exc_info=True)
+
         user_states[user_id] = 'waiting_phone'
         context.user_data.clear()
         await query.edit_message_text(
@@ -3917,6 +3982,23 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if phone:
         phone_to_chat_id[phone] = user_id
 
+        # Также сохраняем/обновляем сведения об агенте в vitrina_agents
+        try:
+            db_manager = await get_db_manager()
+            # Определяем роль (если ADMIN_VIEW, сохраняем сразу)
+            role = ROLE_ADMIN_VIEW if is_admin_view_phone(phone) else None
+            if role:
+                set_user_role(context, role)
+            
+            await db_manager.upsert_vitrina_agent(
+                agent_phone=phone,
+                full_name=agent_name,
+                chat_id=user_id,
+                role=role,
+            )
+        except Exception as e:
+            logger.error(f"Ошибка обновления vitrina_agents для {phone}: {e}", exc_info=True)
+
     # Если номер относится к ADMIN_VIEW_PHONES — назначаем роль ADMIN_VIEW (только просмотр, но доступ ко всем объектам)
     if is_admin_view_phone(phone):
         set_user_role(context, ROLE_ADMIN_VIEW)
@@ -4755,10 +4837,150 @@ async def show_find_objects(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def handle_add_bulk_objects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавляет агенту несколько последних свободных объектов"""
+async def show_bulk_objects_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает промежуточный экран с настройкой фильтра и кнопкой добавления"""
+    query = update.callback_query
+    if query:
+        await show_loading(query)
+    else:
+        query = update.message
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        if hasattr(query, 'edit_message_text'):
+            await query.edit_message_text("❌ Не найден номер телефона")
+        else:
+            await query.reply_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    selected_classes = await db_manager.get_agent_filter_settings(agent_phone)
+    
+    text = "Поиск по фильтру (классы):\n\n"
+    if selected_classes:
+        text += "\n".join(f"- {cls}" for cls in selected_classes)
+    else:
+        text += "Не выбрано"
+    
+    keyboard = [
+        [InlineKeyboardButton("⚙️ Настроить фильтр", callback_data="configure_bulk_filter")],
+        [InlineKeyboardButton("➕ Добавить", callback_data="add_bulk_objects_confirm")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="new_objects")]
+    ]
+    
+    if hasattr(query, 'edit_message_text'):
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_configure_bulk_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню настройки фильтров по классам"""
+    query = update.callback_query
+    await show_loading(query)
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    selected_classes = await db_manager.get_agent_filter_settings(agent_phone) or []
+    
+    # Получаем актуальный список классов из config (через модуль, чтобы получить обновленное значение)
+    import config
+    property_classes = config.PROPERTY_CLASSES if config.PROPERTY_CLASSES else await db_manager.get_distinct_property_classes()
+    
+    # Логируем для отладки
+    logger.debug(f"Классы недвижимости: {property_classes}, выбранные: {selected_classes}")
+    
+    # Получаем доступные классы (исключая уже выбранные)
+    available_classes = [cls for cls in property_classes if cls not in selected_classes]
+    
+    text = "Выберите классы, которые будут вам распределяться (если они есть)\n\n"
+    text += "Поиск будет по классам:\n"
+    if selected_classes:
+        text += "\n".join(f"- {cls}" for cls in selected_classes)
+    else:
+        text += "Не выбрано"
+    
+    keyboard = []
+    
+    # Кнопки для доступных классов (по 2 в ряд)
+    if available_classes:
+        for i in range(0, len(available_classes), 2):
+            row = []
+            row.append(InlineKeyboardButton(available_classes[i], callback_data=f"toggle_property_class_{available_classes[i]}"))
+            if i + 1 < len(available_classes):
+                row.append(InlineKeyboardButton(available_classes[i + 1], callback_data=f"toggle_property_class_{available_classes[i + 1]}"))
+            keyboard.append(row)
+    else:
+        # Если все классы выбраны или список пустой
+        if not property_classes:
+            text += "\n\n⚠️ Список классов не загружен из БД"
+    
+    # Кнопки управления
+    if selected_classes:
+        keyboard.append([InlineKeyboardButton("🗑️ Очистить выбор", callback_data="clear_property_classes")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_from_filter_config")])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_toggle_property_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает переключение выбора класса"""
     query = update.callback_query
     await query.answer()
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    # Извлекаем название класса из callback_data
+    class_name = query.data.replace("toggle_property_class_", "")
+    
+    db_manager = await get_db_manager()
+    selected_classes = await db_manager.get_agent_filter_settings(agent_phone) or []
+    
+    # Добавляем или удаляем класс
+    if class_name in selected_classes:
+        selected_classes.remove(class_name)
+    else:
+        selected_classes.append(class_name)
+    
+    # Сохраняем настройки
+    if selected_classes:
+        await db_manager.save_agent_filter_settings(agent_phone, selected_classes)
+    else:
+        await db_manager.clear_agent_filter_settings(agent_phone)
+    
+    # Показываем обновленное меню
+    await show_configure_bulk_filter(update, context)
+
+
+async def handle_clear_property_classes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очищает выбранные классы"""
+    query = update.callback_query
+    await query.answer()
+    
+    agent_phone = context.user_data.get('phone')
+    if not agent_phone:
+        await query.edit_message_text("❌ Не найден номер телефона")
+        return
+    
+    db_manager = await get_db_manager()
+    await db_manager.clear_agent_filter_settings(agent_phone)
+    
+    # Показываем обновленное меню
+    await show_configure_bulk_filter(update, context)
+
+
+async def handle_add_bulk_objects_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждает добавление объектов с учетом фильтров"""
+    query = update.callback_query
+    await query.answer()
+    await show_loading(query)
     
     agent_phone = context.user_data.get('phone')
     if not agent_phone:
@@ -4784,9 +5006,13 @@ async def handle_add_bulk_objects(update: Update, context: ContextTypes.DEFAULT_
         )
         return
     
+    # Получаем настройки фильтров
+    property_classes_filter = await db_manager.get_agent_filter_settings(agent_phone)
+    
     added_count, vitrina_ids, categories_dict = await db_manager.assign_latest_parsed_properties(
         agent_phone,
-        limit=BULK_ASSIGN_COUNT
+        limit=BULK_ASSIGN_COUNT,
+        property_classes_filter=property_classes_filter
     )
     
     if added_count == 0:
@@ -4807,9 +5033,17 @@ async def handle_add_bulk_objects(update: Update, context: ContextTypes.DEFAULT_
             ids_str = ', '.join(str(vid) for vid in ids_list)
             summary_parts.append(f"\n{category} ({len(ids_list)}): {ids_str}")
     
+    if property_classes_filter:
+        summary_parts.append(f"\n\nФильтр по классам: {', '.join(property_classes_filter)}")
+    
     summary = ''.join(summary_parts)
     await query.message.reply_text(summary)
     await show_new_objects_menu(update, context)
+
+
+async def handle_add_bulk_objects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает промежуточный экран для настройки фильтров"""
+    await show_bulk_objects_filter_menu(update, context)
 
 
 async def show_my_objects_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):

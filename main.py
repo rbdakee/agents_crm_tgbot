@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler
 
 from config import (
     BOT_TOKEN, USE_WEBHOOK, WEBHOOK_URL, WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH, LOG_LEVEL,
-    DATABASE_URL, SYNC_ENABLED, SYNC_INTERVAL_MINUTES, AUTO_TASKS_TIME
+    DATABASE_URL, SYNC_ENABLED, SYNC_INTERVAL_MINUTES, AUTO_TASKS_TIME, refresh_property_classes
 )
 from handlers import setup_handlers, db_stats, manual_sync, manual_sync_with_cats, run_recall_notifications_task
 from health import start_health_server
@@ -170,6 +170,12 @@ async def main():
                 await db_manager.apply_database_optimizations()
             except Exception as e:
                 logging.warning(f"Не удалось применить оптимизации БД (возможно, уже применены): {e}")
+            
+            # Загружаем список классов недвижимости из БД
+            try:
+                await refresh_property_classes()
+            except Exception as e:
+                logging.warning(f"Не удалось загрузить классы недвижимости: {e}")
         except Exception as e:
             logging.error(f"Ошибка авто-миграции схемы с бэкапом: {e}")
             raise

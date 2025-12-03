@@ -5414,37 +5414,48 @@ async def check_and_send_recall_notifications(application: Application):
             vitrina_id = obj.get('vitrina_id')
             address = obj.get('address') or 'N/A'
             krisha_id = obj.get('krisha_id')
-            
-            # Получаем chat_id по номеру телефона
-            chat_id = phone_to_chat_id.get(agent_phone)
-            
-            if chat_id:
-                try:
-                    message_text = (
-                        f"⏰ Напоминание о перезвоне\n\n"
-                        f"Объект ID: {vitrina_id}\n"
-                        f"📍 Адрес: {address}\n"
-                    )
-                    if krisha_id:
-                        message_text += f"🔗 Ссылка: https://krisha.kz/a/show/{krisha_id}\n"
-                    
-                    message_text += "\nНе забудьте перезвонить клиенту!"
-                    
-                    await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=message_text,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔙 К объекту", callback_data=f"parsed_object_{vitrina_id}")]
-                        ])
-                    )
-                    
-                    # Помечаем, что уведомление отправлено (очищаем stats_recall_time)
-                    await db_manager.mark_recall_notification_sent(vitrina_id)
-                    logger.info(f"Отправлено уведомление о перезвоне для объекта {vitrina_id} агенту {agent_phone}")
-                except Exception as e:
-                    logger.error(f"Ошибка отправки уведомления для объекта {vitrina_id}: {e}", exc_info=True)
+
+            # Получаем chat_ids по номеру телефона из vitrina_agents (устойчиво к перезапуску бота)
+            agent_info = await db_manager.get_vitrina_agent_by_phone(agent_phone) if agent_phone else None
+            chat_ids = agent_info.get("chat_ids") if agent_info else []
+
+            if chat_ids:
+                for chat_id_str in chat_ids:
+                    try:
+                        chat_id = int(chat_id_str)
+                    except (TypeError, ValueError):
+                        logger.warning(f"Некорректный chat_id '{chat_id_str}' для телефона {agent_phone}, объект {vitrina_id}")
+                        continue
+
+                    try:
+                        message_text = (
+                            f"⏰ Напоминание о перезвоне\n\n"
+                            f"Объект ID: {vitrina_id}\n"
+                            f"📍 Адрес: {address}\n"
+                        )
+                        if krisha_id:
+                            message_text += f"🔗 Ссылка: https://krisha.kz/a/show/{krisha_id}\n"
+                        
+                        message_text += "\nНе забудьте перезвонить клиенту!"
+                        
+                        await application.bot.send_message(
+                            chat_id=chat_id,
+                            text=message_text,
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("🔙 К объекту", callback_data=f"parsed_object_{vitrina_id}")]
+                            ])
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки уведомления для объекта {vitrina_id} в чат {chat_id}: {e}", exc_info=True)
+
+                # Помечаем, что уведомление отправлено (очищаем stats_recall_time) после попытки отправки по всем chat_ids
+                await db_manager.mark_recall_notification_sent(vitrina_id)
+                logger.info(
+                    f"Отправлено уведомление о перезвоне для объекта {vitrina_id} агенту {agent_phone} "
+                    f"в чаты {chat_ids}"
+                )
             else:
-                logger.warning(f"Не найден chat_id для телефона {agent_phone}, объект {vitrina_id}")
+                logger.warning(f"Не найдены chat_ids в vitrina_agents для телефона {agent_phone}, объект {vitrina_id}")
                 # Все равно помечаем как отправленное, чтобы не спамить
                 await db_manager.mark_recall_notification_sent(vitrina_id)
     

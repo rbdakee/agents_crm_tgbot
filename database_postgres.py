@@ -16,6 +16,7 @@ from config import (
     AGENTS_PHONES_SHEET_GID,
     AGENTS_COOL_CALLS_GID,
     KRISHA_URL_TEMPLATE,
+    RECALL_MAX_AGE_HOURS,
 )
 from api_client import APIClient
 
@@ -96,6 +97,7 @@ parsed_properties_table = Table(
     Column("stats_recall_time", DateTime(timezone=True)),
     Column("stats_description", Text),
     Column("stats_object_category", String(10)),
+    Column("stats_recall_notified", Boolean),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()),
 )
@@ -274,6 +276,7 @@ class PostgreSQLManager:
                             stats_time_given TIMESTAMPTZ,
                             stats_object_status VARCHAR(255),
                             stats_recall_time TIMESTAMPTZ,
+                            stats_recall_notified BOOLEAN DEFAULT FALSE,
                             stats_description TEXT,
                             stats_object_category VARCHAR(10),
                             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -288,7 +291,7 @@ class PostgreSQLManager:
                         "CREATE INDEX IF NOT EXISTS idx_parsed_properties_agent_given ON parsed_properties(stats_agent_given) WHERE stats_agent_given IS NOT NULL",
                         "CREATE INDEX IF NOT EXISTS idx_parsed_properties_status ON parsed_properties(stats_object_status) WHERE stats_object_status IS NOT NULL",
                         "CREATE INDEX IF NOT EXISTS idx_parsed_properties_recall_time ON parsed_properties(stats_recall_time) WHERE stats_recall_time IS NOT NULL",
-                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_recall_notification ON parsed_properties(stats_object_status, stats_recall_time, stats_agent_given) WHERE stats_object_status = 'Перезвонить' AND stats_recall_time IS NOT NULL AND stats_agent_given IS NOT NULL",
+                        "CREATE INDEX IF NOT EXISTS idx_parsed_properties_recall_notification ON parsed_properties(stats_object_status, stats_recall_time, stats_agent_given, stats_recall_notified) WHERE stats_object_status = 'Перезвонить' AND stats_recall_time IS NOT NULL AND stats_agent_given IS NOT NULL AND (stats_recall_notified IS NULL OR stats_recall_notified = FALSE)",
                         "CREATE INDEX IF NOT EXISTS idx_parsed_properties_latest ON parsed_properties(krisha_id, stats_agent_given, krisha_date DESC) WHERE krisha_id IS NOT NULL AND krisha_id != ''",
                         "CREATE INDEX IF NOT EXISTS idx_parsed_properties_time_given ON parsed_properties(stats_time_given DESC NULLS LAST)",
                         "CREATE INDEX IF NOT EXISTS idx_parsed_properties_my_objects ON parsed_properties(stats_agent_given, stats_time_given DESC NULLS LAST, vitrina_id DESC) WHERE stats_agent_given IS NOT NULL",
@@ -318,6 +321,25 @@ class PostgreSQLManager:
                     logger.info("Колонка stats_object_category успешно добавлена в parsed_properties")
                 else:
                     logger.info("Колонка stats_object_category уже существует в parsed_properties")
+
+                # Проверяем наличие колонки stats_recall_notified
+                col_check_recall = await session.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'parsed_properties'
+                      AND column_name = 'stats_recall_notified'
+                """))
+                recall_column_exists = col_check_recall.fetchone() is not None
+
+                if not recall_column_exists:
+                    logger.info("Добавляю колонку stats_recall_notified в parsed_properties...")
+                    await session.execute(text("""
+                        ALTER TABLE parsed_properties 
+                        ADD COLUMN IF NOT EXISTS stats_recall_notified BOOLEAN DEFAULT FALSE
+                    """))
+                    await session.commit()
+                    logger.info("Колонка stats_recall_notified добавлена в parsed_properties")
+                else:
+                    logger.info("Колонка stats_recall_notified уже существует в parsed_properties")
                 
                 # Создаем таблицу vitrina_agents, если её нет
                 agents_table_check = await session.execute(text("""
@@ -2611,6 +2633,35 @@ class PostgreSQLManager:
             logger.error(f"Ошибка получения vitrina_agent по chat_id {chat_id}: {e}", exc_info=True)
             return None
 
+    async def get_vitrina_agent_by_phone(self, agent_phone: str) -> Optional[Dict[str, Any]]:
+        """Возвращает агента по номеру телефона."""
+        try:
+            async with self.async_session() as session:
+                result = await session.execute(
+                    text(
+                        """
+                        SELECT agent_phone, full_name, chat_ids, role, property_classes
+                        FROM vitrina_agents
+                        WHERE agent_phone = :phone
+                        """
+                    ),
+                    {"phone": agent_phone},
+                )
+                row = result.fetchone()
+                if not row:
+                    return None
+
+                return {
+                    "agent_phone": row.agent_phone,
+                    "full_name": row.full_name,
+                    "chat_ids": list(row.chat_ids) if row.chat_ids else [],
+                    "role": row.role,
+                    "property_classes": list(row.property_classes) if row.property_classes else None,
+                }
+        except Exception as e:
+            logger.error(f"Ошибка получения vitrina_agent по телефону {agent_phone}: {e}", exc_info=True)
+            return None
+
     async def clear_vitrina_agent_chat_id(self, agent_phone: str, chat_id: int) -> None:
         """Удаляет конкретный chat_id из массива chat_ids агента (при логауте с одного устройства)."""
         try:
@@ -3516,14 +3567,19 @@ class PostgreSQLManager:
         """Получает объекты, которым нужно отправить уведомление о перезвоне"""
         try:
             async with self.async_session() as session:
-                result = await session.execute(text("""
-                    SELECT vitrina_id, stats_agent_given, stats_recall_time, address, krisha_id
-                    FROM parsed_properties
-                    WHERE stats_object_status = 'Перезвонить'
-                      AND stats_recall_time IS NOT NULL
-                      AND stats_recall_time <= NOW() AT TIME ZONE 'Asia/Almaty'
-                      AND stats_agent_given IS NOT NULL
-                """))
+                result = await session.execute(
+                    text("""
+                        SELECT vitrina_id, stats_agent_given, stats_recall_time, address, krisha_id
+                        FROM parsed_properties
+                        WHERE stats_object_status = 'Перезвонить'
+                          AND stats_recall_time IS NOT NULL
+                          AND stats_recall_time <= NOW()
+                          AND stats_recall_time >= NOW() - (:max_age_hours * INTERVAL '1 hour')
+                          AND (stats_recall_notified IS NULL OR stats_recall_notified = FALSE)
+                          AND stats_agent_given IS NOT NULL
+                    """),
+                    {"max_age_hours": RECALL_MAX_AGE_HOURS},
+                )
                 return [
                     {
                         "vitrina_id": row.vitrina_id,
@@ -3539,12 +3595,12 @@ class PostgreSQLManager:
             return []
 
     async def mark_recall_notification_sent(self, vitrina_id: int) -> None:
-        """Помечает, что уведомление о перезвоне было отправлено (очищает stats_recall_time)"""
+        """Помечает, что уведомление о перезвоне было отправлено (отмечает флагом, но не очищает время перезвона)"""
         try:
             async with self.async_session() as session:
                 await session.execute(text("""
                     UPDATE parsed_properties
-                    SET stats_recall_time = NULL,
+                    SET stats_recall_notified = TRUE,
                         updated_at = NOW()
                     WHERE vitrina_id = :vitrina_id
                 """), {"vitrina_id": vitrina_id})

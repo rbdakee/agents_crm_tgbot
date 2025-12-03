@@ -153,7 +153,17 @@ COLLAGE_TEMPLATE = """
     .footer-left { display:flex; flex-direction: column; gap: 12px; background: transparent; height: 100%; }
     .footer-title .label { font-size: 68px; font-weight: 900; letter-spacing: .5px; color: #fff; }
     .info-footer .address { color: #fff; }
-    .specs-vertical { display:flex; flex-direction: column; gap: 20px; align-items: center; justify-self: end; padding: 20px 0; }
+    .specs-vertical { 
+      display:flex; 
+      flex-direction: column; 
+      gap: 20px; 
+      align-items: center; 
+      justify-self: end; 
+      padding: 20px 0;
+      max-width: 100%;
+      width: 100%;
+      box-sizing: border-box;
+    }
     /* Fallback for browsers without flex-gap support */
     .specs-vertical .spec + .spec { margin-top: 20px; }
 
@@ -179,9 +189,11 @@ COLLAGE_TEMPLATE = """
       box-shadow: var(--shadow);
       font-size: 22px;
       min-height: 120px;
-      width: 230px;
+      width: 100%;
+      max-width: 230px;
       text-align: center;
       white-space: pre-line;
+      box-sizing: border-box;
     }
     .spec img { width: 64px; height: 64px; opacity: .9; }
 
@@ -190,7 +202,8 @@ COLLAGE_TEMPLATE = """
       margin-top: 18px;
       background: transparent;
       border-radius: 16px;
-      padding: 18px;
+      /* Сдвигаем блок достоинств левее: почти прижимаем к левому краю (2px) */
+      padding: 18px 18px 18px 2px;
       flex: 1;
       min-height: 300px;
     }

@@ -2508,6 +2508,7 @@ class PostgreSQLManager:
                         COUNT(*) as total,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Не позвонили') as not_called,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Перезвонить') as recall,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Недозвон') as no_answer,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Встреча') as meeting,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Договор') as deal,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Отказ') as rejected,
@@ -2523,15 +2524,16 @@ class PostgreSQLManager:
                         "total": row.total or 0,
                         "not_called": row.not_called or 0,
                         "recall": row.recall or 0,
+                        "no_answer": row.no_answer or 0,
                         "meeting": row.meeting or 0,
                         "deal": row.deal or 0,
                         "rejected": row.rejected or 0,
                         "archived": row.archived or 0,
                     }
-                return {"total": 0, "not_called": 0, "recall": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
+                return {"total": 0, "not_called": 0, "recall": 0, "no_answer": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
         except Exception as e:
             logger.error(f"Ошибка получения статистики по статусам: {e}", exc_info=True)
-            return {"total": 0, "not_called": 0, "recall": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
+            return {"total": 0, "not_called": 0, "recall": 0, "no_answer": 0, "meeting": 0, "deal": 0, "rejected": 0, "archived": 0}
 
     async def get_distinct_property_classes(self) -> List[str]:
         """Получает список уникальных классов недвижимости из БД (исключая NULL)"""
@@ -2906,6 +2908,9 @@ class PostgreSQLManager:
                                          AND stats_object_status = 'Перезвонить')  AS recall,
                         COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
                                          AND stats_agent_given IS NOT NULL
+                                         AND stats_object_status = 'Недозвон')      AS no_answer,
+                        COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
+                                         AND stats_agent_given IS NOT NULL
                                          AND stats_object_status = 'Встреча')      AS meeting,
                         COUNT(*) FILTER (WHERE krisha_id IS NOT NULL AND krisha_id != '' 
                                          AND stats_agent_given IS NOT NULL
@@ -2941,6 +2946,7 @@ class PostgreSQLManager:
                         COUNT(*) AS total,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Не позвонили') AS not_called,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Перезвонить')  AS recall,
+                        COUNT(*) FILTER (WHERE stats_object_status = 'Недозвон')      AS no_answer,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Встреча')      AS meeting,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Договор')      AS deal,
                         COUNT(*) FILTER (WHERE stats_object_status = 'Отказ')        AS rejected,
@@ -2966,6 +2972,7 @@ class PostgreSQLManager:
                     "Всего объектов взято",
                     "Не позвонили",
                     "Перезвонить",
+                    "Недозвон",
                     "Встреча",
                     "Договор",
                     "Отказ",
@@ -2978,6 +2985,7 @@ class PostgreSQLManager:
                         overall_row.total_taken or 0,
                         overall_row.not_called or 0,
                         overall_row.recall or 0,
+                        overall_row.no_answer or 0,
                         overall_row.meeting or 0,
                         overall_row.deal or 0,
                         overall_row.rejected or 0,
@@ -2994,7 +3002,11 @@ class PostgreSQLManager:
                         0,
                         0,
                         0,
+                        0,
                     ])
+
+                # Заголовок таблицы объектов (один для всех агентов)
+                header_added = False
 
                 # Далее блоки по каждому агенту
                 for agent_stats in per_agent_rows:
@@ -3008,48 +3020,31 @@ class PostgreSQLManager:
                             tail10 = digits[-10:]
                             name = phone_to_name_sheet.get(tail10, "")
 
-                    # Таблица-итог по агенту (2 строки)
-                    # Запоминаем индекс пустой строки (1-based: текущая длина + 1)
-                    empty_row_indices.append(len(values) + 1)
-                    values.append([])  # Пустая строка как разделитель блоков
-                    values.append([
-                        "Телефон агента",
-                        "ФИО",
-                        "Всего объектов",
-                        "Не позвонили",
-                        "Перезвонить",
-                        "Встреча",
-                        "Договор",
-                        "Отказ",
-                        "Архив",
-                    ])
-                    values.append([
-                        phone,
-                        name,
-                        agent_stats.total or 0,
-                        agent_stats.not_called or 0,
-                        agent_stats.recall or 0,
-                        agent_stats.meeting or 0,
-                        agent_stats.deal or 0,
-                        agent_stats.rejected or 0,
-                        agent_stats.archived or 0,
-                    ])
-
-                    # Заголовок для объектов агента
-                    values.append([
-                        "vitrina ID",
-                        "Адрес",
-                        "ЖК",
-                        "Класс",
-                        "Цена",
-                        "Контакты",
-                        "Площадь",
-                        "Категория",
-                        "krishakz",
-                        "Статус",
-                        "Комментарии",
-                        "Время получения",
-                    ])
+                    # Добавляем заголовок таблицы только один раз (перед первым агентом)
+                    if not header_added:
+                        empty_row_indices.append(len(values) + 1)
+                        values.append([])  # Пустая строка как разделитель блоков
+                        values.append([
+                            "vitrina ID",
+                            "Телефон агента",
+                            "ФИО",
+                            "Адрес",
+                            "ЖК",
+                            "Класс",
+                            "Цена",
+                            "Контакты",
+                            "Площадь",
+                            "Категория",
+                            "krishakz",
+                            "Статус",
+                            "Комментарии",
+                            "Время получения",
+                        ])
+                        header_added = True
+                    else:
+                        # Для последующих агентов добавляем только пустую строку-разделитель
+                        empty_row_indices.append(len(values) + 1)
+                        values.append([])  # Пустая строка как разделитель блоков
 
                     # Объекты агента
                     agent_objects_sql = text(
@@ -3095,6 +3090,8 @@ class PostgreSQLManager:
 
                         values.append([
                             obj.vitrina_id,
+                            phone,  # Телефон агента
+                            name,   # ФИО агента
                             obj.address or "",
                             obj.complex or "",
                             obj.property_class or "",

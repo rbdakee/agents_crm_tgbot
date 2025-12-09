@@ -51,7 +51,7 @@ user_last_messages: Dict[int, object] = {}
 user_pending_downloads: Dict[int, int] = {}
 phone_to_chat_id: Dict[str, int] = {}
 
-NON_REALIZED_STATUSES = ['Не позвонили', 'Перезвонить', 'Встреча']
+NON_REALIZED_STATUSES = ['Не позвонили', 'Перезвонить', 'Встреча', 'Недозвон']
 REALIZED_STATUSES = ['Договор', 'Отказ', 'Архив']
 
 SUPPORT_INLINE_KEYBOARD = InlineKeyboardMarkup([
@@ -4745,6 +4745,7 @@ async def show_new_objects_menu(update: Update, context: ContextTypes.DEFAULT_TY
     non_realized_total = (
         stats.get('not_called', 0) +
         stats.get('recall', 0) +
+        stats.get('no_answer', 0) +
         stats.get('meeting', 0)
     )
     realized_total = (
@@ -4993,6 +4994,7 @@ async def handle_add_bulk_objects_confirm(update: Update, context: ContextTypes.
     non_realized_count = (
         stats.get('not_called', 0) +
         stats.get('recall', 0) +
+        stats.get('no_answer', 0) +
         stats.get('meeting', 0)
     )
     
@@ -5064,7 +5066,7 @@ async def show_my_objects_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Вычисляем реализованные и нереализованные объекты
     realized = stats.get('deal', 0) + stats.get('rejected', 0) + stats.get('archived', 0)
-    non_realized = stats.get('not_called', 0) + stats.get('recall', 0) + stats.get('meeting', 0)
+    non_realized = stats.get('not_called', 0) + stats.get('recall', 0) + stats.get('no_answer', 0) + stats.get('meeting', 0)
     total = stats.get('total', 0)
     
     text = "📋 Мои новые объекты\n\n"
@@ -5226,6 +5228,7 @@ def format_status_with_emoji(status: Optional[str]) -> str:
     status_map = {
         'Не позвонили': '📞 Не позвонили',
         'Перезвонить': '📞 Перезвонить',
+        'Недозвон': '📞 Недозвон',
         'Встреча': '🤝 Встреча',
         'Переговоры': '🤝 Встреча',
         'Договор': '✅ Договор',
@@ -5343,6 +5346,7 @@ async def show_status_selection(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [
         [InlineKeyboardButton("📞 Не позвонили", callback_data=f"status_Не позвонили_{vitrina_id}")],
         [InlineKeyboardButton("📞 Перезвонить", callback_data=f"status_Перезвонить_{vitrina_id}")],
+        [InlineKeyboardButton("📞 Недозвон", callback_data=f"status_Недозвон_{vitrina_id}")],
         [InlineKeyboardButton("🤝 Встреча", callback_data=f"status_Встреча_{vitrina_id}")],
         [InlineKeyboardButton("✅ Договор", callback_data=f"status_Договор_{vitrina_id}")],
         [InlineKeyboardButton("❌ Отказ", callback_data=f"status_Отказ_{vitrina_id}")],

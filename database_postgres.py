@@ -2860,8 +2860,18 @@ class PostgreSQLManager:
             agents_ws = await asyncio.to_thread(spreadsheet.get_worksheet_by_id, int(AGENTS_PHONES_SHEET_GID))
             stats_ws = await asyncio.to_thread(spreadsheet.get_worksheet_by_id, int(AGENTS_COOL_CALLS_GID))
 
-            # Строим карту телефон (10 цифр) -> ФИО из листа AGENTS_PHONES_SHEET_GID
-            phone_to_name: Dict[str, str] = {}
+            # 1) Основной источник: vitrina_agents (phone уже нормализован)
+            phone_to_name_db: Dict[str, str] = {}
+            async with self.async_session() as session_agents:
+                vitrina_rows = await session_agents.execute(text("SELECT agent_phone, full_name FROM vitrina_agents"))
+                for row in vitrina_rows.fetchall():
+                    phone = (row.agent_phone or "").strip()
+                    full_name = (row.full_name or "").strip()
+                    if phone and full_name and phone not in phone_to_name_db:
+                        phone_to_name_db[phone] = full_name
+
+            # 2) Резерв: лист AGENTS_PHONES_SHEET_GID (нормализация до хвоста 10 цифр)
+            phone_to_name_sheet: Dict[str, str] = {}
             agents_rows = await asyncio.to_thread(agents_ws.get_all_values) or []
             # Ожидается: A: ФИО, B: Контакты; первая строка — заголовки
             for idx, row in enumerate(agents_rows[1:], start=2):
@@ -2871,14 +2881,12 @@ class PostgreSQLManager:
                 phones_raw = (row[1] or "").strip()
                 if not name or not phones_raw:
                     continue
-                # Убираем всё, кроме цифр и берём последние 10 символов для нормализации
-                digits = re.sub(r"\\D", "", phones_raw)
+                digits = re.sub(r"\D", "", phones_raw)
                 if not digits:
                     continue
                 if len(digits) >= 10:
                     tail10 = digits[-10:]
-                    # Первое совпадение считаем основным ФИО
-                    phone_to_name.setdefault(tail10, name)
+                    phone_to_name_sheet.setdefault(tail10, name)
 
             async with self.async_session() as session:
                 # Общая статистика:
@@ -2991,7 +2999,14 @@ class PostgreSQLManager:
                 # Далее блоки по каждому агенту
                 for agent_stats in per_agent_rows:
                     phone = agent_stats.stats_agent_given or ""
-                    name = phone_to_name.get(phone, "")
+                    # 1-й приоритет: vitrina_agents (точное совпадение)
+                    name = phone_to_name_db.get(phone, "")
+                    # 2-й приоритет: лист телефонов (по последним 10 цифрам)
+                    if not name and phone:
+                        digits = re.sub(r"\D", "", phone)
+                        if len(digits) >= 10:
+                            tail10 = digits[-10:]
+                            name = phone_to_name_sheet.get(tail10, "")
 
                     # Таблица-итог по агенту (2 строки)
                     # Запоминаем индекс пустой строки (1-based: текущая длина + 1)
@@ -3095,12 +3110,29 @@ class PostgreSQLManager:
 
             # Полностью перезаписываем лист статистики (через to_thread, чтобы не блокировать event loop)
             await asyncio.to_thread(stats_ws.clear)
+
+            # Сбрасываем прошлое форматирование заливки на всём листе (чтобы старые серые строки не оставались)
+            sheet_id = stats_ws.id
+            reset_requests = [{
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'backgroundColor': None
+                        }
+                    },
+                    'fields': 'userEnteredFormat.backgroundColor'
+                }
+            }]
+            await asyncio.to_thread(spreadsheet.batch_update, {'requests': reset_requests})
+
             if values:
                 await asyncio.to_thread(stats_ws.update, 'A1', values, value_input_option='USER_ENTERED')
                 
                 # Форматируем пустые строки-разделители: заливка "dark grey 2" (RGB: 217, 217, 217)
                 if empty_row_indices:
-                    sheet_id = stats_ws.id
                     requests = []
                     for row_idx in empty_row_indices:
                         # Форматируем всю строку (колонки A-Z, чтобы покрыть все возможные данные)

@@ -36,6 +36,10 @@ AGENTS_PHONES_SHEET_GID = os.getenv('AGENTS_PHONES_SHEET_GID')
 # Лист для отчета по холодным звонкам (общая и покомпонентная статистика)
 AGENTS_COOL_CALLS_GID = os.getenv('AGENTS_COOL_CALLS_GID')
 
+# Лист с историей изменения цен ЖК
+PRICE_HISTORY_SHEET_ID = os.getenv('PRICE_HISTORY_SHEET_ID')  # ID таблицы с историей цен
+PRICE_HISTORY_SHEET_GID = os.getenv('PRICE_HISTORY_SHEET_GID')  # GID листа с данными
+
 # PostgreSQL Database
 DATABASE_URL = os.getenv('DATABASE_URL')  # URL подключения к PostgreSQL
 if not DATABASE_URL:

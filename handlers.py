@@ -1028,6 +1028,11 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
             keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
             keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
 
+    # Добавляем кнопку "Посмотреть Аналитику" если есть ЖК
+    complex_name = contract.get('ЖК') or contract.get('complex') or ''
+    if complex_name and complex_name.strip() and complex_name != 'N/A':
+        keyboard.append([InlineKeyboardButton("📊 Посмотреть Аналитику", callback_data=f"analytics_menu_{crm_id}")])
+
     keyboard.append([InlineKeyboardButton("🔙 Назад к списку", callback_data=back_to_list_callback)])
     keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
     
@@ -1048,6 +1053,232 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
             sent_message = await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML', disable_web_page_preview=True)
         user_id = update.effective_user.id
         user_last_messages[user_id] = sent_message
+
+
+async def show_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
+    """Показывает меню аналитики для объекта"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
+
+    agent_name = context.user_data.get('agent_name')
+    if not agent_name:
+        await query.edit_message_text("Ошибка: агент не найден")
+        return
+
+    db_manager = await get_db_manager()
+    role = get_user_role(context)
+    name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
+    contract = await db_manager.search_contract_by_crm_id(crm_id, name_for_query, role)
+    
+    if not contract:
+        await query.edit_message_text("Контракт не найден среди ваших сделок")
+        return
+
+    # Получаем название ЖК
+    complex_name = contract.get('ЖК') or contract.get('complex') or ''
+    
+    if not complex_name or complex_name.strip() == '' or complex_name == 'N/A':
+        await query.edit_message_text(
+            "❌ Аналитика недоступна: не указан ЖК для данного объекта",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
+            ])
+        )
+        return
+
+    # Формируем сообщение с меню аналитики
+    message = f"📊 В данный момент существует аналитика по ЖК {complex_name}:\n\n"
+    message += "• График изменения цены"
+
+    keyboard = [
+        [InlineKeyboardButton("📈 График изменения цены", callback_data=f"price_chart_{crm_id}")],
+        [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
+    ]
+
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
+    """Показывает график изменения цены для объекта"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Failed to answer callback query: {e}")
+
+    await show_loading(query)
+
+    agent_name = context.user_data.get('agent_name')
+    if not agent_name:
+        await query.edit_message_text("Ошибка: агент не найден")
+        return
+
+    db_manager = await get_db_manager()
+    role = get_user_role(context)
+    name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
+    contract = await db_manager.search_contract_by_crm_id(crm_id, name_for_query, role)
+    
+    if not contract:
+        await query.edit_message_text("Контракт не найден среди ваших сделок")
+        return
+
+    # Получаем название ЖК
+    complex_name = contract.get('ЖК') or contract.get('complex') or ''
+    
+    if not complex_name or complex_name.strip() == '' or complex_name == 'N/A':
+        await query.edit_message_text(
+            "❌ Аналитика недоступна: не указан ЖК для данного объекта",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data=f"analytics_menu_{crm_id}")]
+            ])
+        )
+        return
+
+    loading_message_deleted = False
+    try:
+        # Импортируем сервис для работы с историей цен
+        from services.price_history_service import get_price_history_for_complex, generate_price_chart
+
+        # Получаем историю цен
+        price_data = await get_price_history_for_complex(complex_name)
+        
+        if not price_data.get('found'):
+            await query.edit_message_text(
+                f"❌ Данные по ЖК '{complex_name}' не найдены в таблице истории цен",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
+                ])
+            )
+            return
+
+        # Генерируем график
+        try:
+            chart_bytes = generate_price_chart(price_data)
+        except ValueError as e:
+            await query.edit_message_text(
+                f"❌ Недостаточно данных для построения графика: {str(e)}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
+                ])
+            )
+            return
+
+        # Отправляем график с кнопкой "Назад"
+        from io import BytesIO
+        chart_file = BytesIO(chart_bytes)
+        chart_file.name = f"price_chart_{crm_id}.png"
+        
+        # Формируем caption с информацией об объекте
+        caption = f"📈 График изменения цены для ЖК: {price_data.get('complex_name', complex_name)}\n\n"
+        
+        # Цена из договора
+        contract_price = contract.get('Цена указанная в договоре') or contract.get('contract_price') or 'N/A'
+        caption += f"💰 Цена: {contract_price}\n"
+        
+        # Альтернативная цена
+        krisha_price = contract.get('krisha_price')
+        vitrina_price = contract.get('vitrina_price')
+        if krisha_price is not None and vitrina_price is not None:
+            try:
+                krisha_val = float(krisha_price) if krisha_price != '' and krisha_price is not None else None
+                vitrina_val = float(vitrina_price) if vitrina_price != '' and vitrina_price is not None else None
+                if krisha_val is not None and vitrina_val is not None and krisha_val > 0 and vitrina_val > 0:
+                    alt_price = int((krisha_val + vitrina_val) / 2)
+                    caption += f"💱 Альтернативная цена: {alt_price}\n"
+            except (ValueError, TypeError):
+                pass
+        
+        # Рейтинг
+        score = contract.get('score')
+        if score is not None:
+            try:
+                if score != '':
+                    score_val = float(score)
+                    caption += f"⭐ Рейтинг: {score_val:.1f}\n"
+            except (ValueError, TypeError):
+                pass
+        
+        # Категория
+        category_val = contract.get('category', 'N/A')
+        caption += f"📂 Категория: {category_val}\n"
+        
+        # Показы
+        shows = contract.get('shows', 0)
+        caption += f"👁️ Показы: {shows}\n"
+        
+        # Последние ссылки (берем последнюю через split(';'))
+        link_fields = [
+            ("Tiktok", 'tiktok'),
+            ("Instagram", 'instagram'),
+            ("Krisha", 'krisha'),
+            ("Mailing", 'mailing'),
+            ("Stream", 'stream'),
+        ]
+        available_links = []
+        for label, field in link_fields:
+            value = contract.get(field, '')
+            if value and isinstance(value, str):
+                # Разделяем по ';' и берем последнюю ссылку
+                links = [link.strip() for link in value.split(';') if link.strip()]
+                if links:
+                    last_link = links[-1]
+                    # Форматируем в HTML: <a href="url">текст</a>
+                    # Экранируем HTML-символы в URL
+                    escaped_url = html.escape(last_link, quote=True)
+                    available_links.append(f'<a href="{escaped_url}">{label}</a>')
+        
+        if available_links:
+            caption += f"\n🔗 Ссылки: {', '.join(available_links)}"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"back_from_chart_{crm_id}")]
+        ]
+        
+        try:
+            # Пытаемся удалить сообщение с загрузкой
+            await query.message.delete()
+            loading_message_deleted = True
+        except Exception:
+            # Если не удалось удалить, продолжаем
+            pass
+        
+        # Отправляем график с кнопкой "Назад"
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=chart_file,
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при генерации графика для ЖК '{complex_name}': {e}", exc_info=True)
+        # Проверяем, было ли удалено сообщение с загрузкой
+        try:
+            if not loading_message_deleted:
+                await query.edit_message_text(
+                    f"❌ Ошибка при загрузке данных или генерации графика: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
+                    ])
+                )
+            else:
+                # Если сообщение удалено, отправляем новое
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"❌ Ошибка при загрузке данных или генерации графика: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
+                    ])
+                )
+        except Exception as edit_error:
+            logger.error(f"Ошибка при обработке ошибки: {edit_error}", exc_info=True)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1165,6 +1396,59 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = 'authenticated'
         await show_loading(query)
         await show_contract_detail(update, context, crm_id)
+
+    elif data.startswith("analytics_menu_"):
+        # Обработка кнопки "Посмотреть Аналитику" - сразу показываем график
+        crm_id = data.replace("analytics_menu_", "")
+        await show_price_chart(update, context, crm_id)
+
+    elif data.startswith("price_chart_"):
+        # Обработка кнопки "График изменения цены"
+        crm_id = data.replace("price_chart_", "")
+        await show_price_chart(update, context, crm_id)
+    
+    elif data.startswith("back_from_chart_"):
+        # Обработка кнопки "Назад" под графиком
+        crm_id = data.replace("back_from_chart_", "")
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.warning(f"Failed to answer callback query: {e}")
+        
+        # Редактируем сообщение с графиком, убирая кнопку
+        try:
+            if query.message.photo:
+                # Если сообщение содержит фото, редактируем только caption и убираем кнопку
+                caption = query.message.caption or ""
+                await query.message.edit_caption(caption=caption, reply_markup=None)
+            else:
+                # Если это текстовое сообщение, редактируем текст
+                await query.edit_message_text(
+                    query.message.text or query.message.caption or "",
+                    reply_markup=None
+                )
+        except Exception as e:
+            logger.warning(f"Не удалось отредактировать сообщение с графиком: {e}")
+        
+        # Отправляем новое сообщение с карточкой объекта
+        agent_name = context.user_data.get('agent_name')
+        if not agent_name:
+            await query.message.reply_text("Ошибка: агент не найден")
+            return
+        
+        db_manager = await get_db_manager()
+        role = get_user_role(context)
+        name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
+        contract = await db_manager.search_contract_by_crm_id(crm_id, name_for_query, role)
+        
+        if not contract:
+            await query.message.reply_text("Контракт не найден среди ваших сделок")
+            return
+        
+        # Создаем update с message для show_contract_detail_by_contract
+        fake_update = Update(update_id=0, message=query.message)
+        await show_contract_detail_by_contract(fake_update, context, contract, force_new_message=True)
 
     elif data.startswith("page_"):
         # Обработка пагинации

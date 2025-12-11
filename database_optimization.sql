@@ -101,18 +101,7 @@ ANALYZE properties;
 ANALYZE parsed_properties;
 
 -- ============================================
--- Комментарии к индексам
+-- Комментарии к индексам удалены
+-- Они вызывали ошибки при отсутствии индексов
 -- ============================================
-
-COMMENT ON INDEX idx_parsed_properties_krisha_id IS 'Индекс для поиска объектов по krisha_id (get_latest_parsed_properties)';
-COMMENT ON INDEX idx_parsed_properties_agent_given IS 'Индекс для поиска объектов по агенту (stats_agent_given)';
-COMMENT ON INDEX idx_parsed_properties_status IS 'Индекс для фильтрации по статусу объекта';
-COMMENT ON INDEX idx_parsed_properties_recall_time IS 'Индекс для поиска объектов с временем перезвона';
-COMMENT ON INDEX idx_parsed_properties_recall_notification IS 'Составной индекс для уведомлений о перезвоне';
-COMMENT ON INDEX idx_parsed_properties_latest IS 'Составной индекс для получения последних объектов';
-COMMENT ON INDEX idx_parsed_properties_my_objects IS 'Составной индекс для получения объектов агента';
-COMMENT ON INDEX idx_properties_category IS 'Индекс для фильтрации и группировки по категории';
-COMMENT ON INDEX idx_properties_mop_lower IS 'Индекс для case-insensitive поиска по МОП';
-COMMENT ON INDEX idx_properties_rop_lower IS 'Индекс для case-insensitive поиска по РОП';
-COMMENT ON INDEX idx_properties_dd_lower IS 'Индекс для case-insensitive поиска по ДД';
 

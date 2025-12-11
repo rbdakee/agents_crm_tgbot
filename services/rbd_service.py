@@ -2,9 +2,16 @@ import json, logging, httpx
 from typing import Any, Dict, List, Optional
 from dateutil import parser as date_parser
 from config import (
-    RBD_MAX_DUPLICATES, RBD_EMAIL, RBD_PASSWORD, HTTP_TIMEOUT,
-    RBD_SUPPLY_SEARCH_URL, RBD_LOGIN_URL, RBD_USER_AGENT, RBD_BASE_URL,
-    RBD_RAW_DATA_JSON
+    RBD_MAX_DUPLICATES,
+    RBD_EMAIL,
+    RBD_PASSWORD,
+    HTTP_TIMEOUT,
+    RBD_SUPPLY_SEARCH_URL,
+    RBD_LOGIN_URL,
+    RBD_USER_AGENT,
+    RBD_BASE_URL,
+    RBD_RAW_DATA_JSON,
+    refresh_property_classes,
 )
 from database_postgres import get_db_manager
 
@@ -248,6 +255,13 @@ async def fetch_new_objects(max_duplicates: Optional[int] = None) -> Dict[str, A
                 break
 
             page += 1
+
+    # После загрузки новых данных обновляем классы недвижимости из БД,
+    # чтобы PROPERTY_CLASSES содержал актуальные значения.
+    try:
+        await refresh_property_classes()
+    except Exception as e:
+        logger.warning(f"Не удалось обновить классы недвижимости после парсинга: {e}")
 
     return stats
 

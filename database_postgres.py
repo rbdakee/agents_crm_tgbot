@@ -150,26 +150,63 @@ class PostgreSQLManager:
                 # Читаем SQL файл с оптимизациями
                 optimization_file = os.path.join(os.path.dirname(__file__), 'database_optimization.sql')
                 
-                if os.path.exists(optimization_file):
-                    with open(optimization_file, 'r', encoding='utf-8') as f:
-                        sql_content = f.read()
-                    
-                    # Выполняем SQL команды (разделяем по ;)
-                    statements = [s.strip() for s in sql_content.split(';') if s.strip() and not s.strip().startswith('--')]
-                    
-                    for statement in statements:
-                        if statement:
-                            try:
-                                await session.execute(text(statement))
-                            except Exception as e:
-                                # Игнорируем ошибки "already exists" для индексов
-                                if 'already exists' not in str(e).lower():
-                                    logger.warning(f"Ошибка при применении оптимизации: {e}")
-                    
+                if not os.path.exists(optimization_file):
+                    return
+                
+                with open(optimization_file, 'r', encoding='utf-8') as f:
+                    sql_content = f.read()
+                
+                # Выполняем SQL команды (разделяем по ;)
+                # Пропускаем COMMENT ON INDEX - они вызывают ошибки если индекс не существует
+                statements = []
+                for s in sql_content.split(';'):
+                    stmt = s.strip()
+                    if stmt and not stmt.startswith('--'):
+                        # Пропускаем COMMENT ON INDEX команды
+                        if stmt.upper().startswith('COMMENT ON INDEX'):
+                            continue
+                        statements.append(stmt)
+                
+                errors = []
+                for statement in statements:
+                    if not statement:
+                        continue
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        # Игнорируем ожидаемые ошибки
+                        ignorable_errors = [
+                            'already exists',
+                            'does not exist',
+                            'undefinedtableerror',
+                            'relation',
+                            'infailedsqltransactionerror'
+                        ]
+                        if any(err in error_str for err in ignorable_errors):
+                            continue
+                        # Сохраняем только реальные ошибки
+                        errors.append((statement[:80], str(e)))
+                        # Если транзакция в состоянии ошибки, делаем rollback
+                        try:
+                            await session.rollback()
+                            await session.begin()
+                        except Exception:
+                            pass
+                
+                try:
                     await session.commit()
-                    logger.info("Оптимизации БД успешно применены")
-                else:
-                    logger.warning(f"Файл оптимизации не найден: {optimization_file}")
+                except Exception as commit_error:
+                    errors.append(('commit', str(commit_error)))
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                
+                # Логируем только реальные ошибки
+                if errors:
+                    for stmt, err in errors:
+                        logger.warning(f"Ошибка при применении оптимизации ({stmt}...): {err}")
         except Exception as e:
             logger.error(f"Ошибка применения оптимизаций БД: {e}", exc_info=True)
 
@@ -192,7 +229,7 @@ class PostgreSQLManager:
                 required = {'area','krisha_price','vitrina_price','score','rooms_count'}
                 missing = required - existing
                 if not missing:
-                    logger.info("Схема таблицы properties уже содержит все новые колонки")
+                    # Не логируем, если все колонки уже есть
                     return
 
                 logger.warning(f"Обнаружены отсутствующие колонки в properties: {missing}. Создаю резервную копию и применяю ALTER...")
@@ -209,8 +246,7 @@ class PostgreSQLManager:
                     # Создаём snapshot с данными
                     await session.execute(text("CREATE TABLE properties_backup AS TABLE properties WITH DATA"))
                     logger.info("Таблица properties_backup создана и заполнена")
-                else:
-                    logger.info("Таблица properties_backup уже существует — пропускаю создание")
+                # Таблица properties_backup уже существует — пропускаем создание
 
                 # Добавляем недостающие колонки
                 alter_stmts = []
@@ -312,15 +348,12 @@ class PostgreSQLManager:
                 column_exists = col_check.fetchone() is not None
 
                 if not column_exists:
-                    logger.info("Добавляю колонку stats_object_category в parsed_properties...")
                     await session.execute(text("""
                         ALTER TABLE parsed_properties 
                         ADD COLUMN IF NOT EXISTS stats_object_category VARCHAR(10)
                     """))
                     await session.commit()
-                    logger.info("Колонка stats_object_category успешно добавлена в parsed_properties")
-                else:
-                    logger.info("Колонка stats_object_category уже существует в parsed_properties")
+                    logger.info("Колонка stats_object_category добавлена в parsed_properties")
 
                 # Проверяем наличие колонки stats_recall_notified
                 col_check_recall = await session.execute(text("""
@@ -331,15 +364,12 @@ class PostgreSQLManager:
                 recall_column_exists = col_check_recall.fetchone() is not None
 
                 if not recall_column_exists:
-                    logger.info("Добавляю колонку stats_recall_notified в parsed_properties...")
                     await session.execute(text("""
                         ALTER TABLE parsed_properties 
                         ADD COLUMN IF NOT EXISTS stats_recall_notified BOOLEAN DEFAULT FALSE
                     """))
                     await session.commit()
                     logger.info("Колонка stats_recall_notified добавлена в parsed_properties")
-                else:
-                    logger.info("Колонка stats_recall_notified уже существует в parsed_properties")
                 
                 # Создаем таблицу vitrina_agents, если её нет
                 agents_table_check = await session.execute(text("""
@@ -370,7 +400,6 @@ class PostgreSQLManager:
                     await session.commit()
                     logger.info("Таблица vitrina_agents создана вместе с индексами")
                 else:
-                    logger.info("Таблица vitrina_agents уже существует")
                     # Безопасно добавляем недостающие колонки, если их нет
                     columns_check = await session.execute(text("""
                         SELECT column_name 
@@ -381,7 +410,6 @@ class PostgreSQLManager:
                     
                     # Добавляем chat_ids, если его нет (миграция со старой структуры)
                     if 'chat_ids' not in existing_columns:
-                        logger.info("Добавляю колонку chat_ids в vitrina_agents...")
                         await session.execute(text("""
                             ALTER TABLE vitrina_agents 
                             ADD COLUMN IF NOT EXISTS chat_ids TEXT[]
@@ -391,7 +419,6 @@ class PostgreSQLManager:
                     
                     # Добавляем role, если его нет
                     if 'role' not in existing_columns:
-                        logger.info("Добавляю колонку role в vitrina_agents...")
                         await session.execute(text("""
                             ALTER TABLE vitrina_agents 
                             ADD COLUMN IF NOT EXISTS role VARCHAR(50)
@@ -408,7 +435,6 @@ class PostgreSQLManager:
                         )
                     """))
                     if not index_check.scalar():
-                        logger.info("Создаю индекс idx_vitrina_agents_chat_ids...")
                         await session.execute(text("""
                             CREATE INDEX IF NOT EXISTS idx_vitrina_agents_chat_ids 
                             ON vitrina_agents USING GIN (chat_ids)

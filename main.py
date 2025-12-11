@@ -38,6 +38,10 @@ def setup_logging():
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('telegram').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
+    # Подавляем логи от Apify
+    logging.getLogger('apify').setLevel(logging.ERROR)
+    logging.getLogger('apify_client').setLevel(logging.ERROR)
+    logging.getLogger('ApifyClient').setLevel(logging.ERROR)
 
 # Graceful shutdown
 def signal_handler(signum, frame):

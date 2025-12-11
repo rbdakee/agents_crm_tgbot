@@ -22,3 +22,5 @@ psycopg2-binary
 APScheduler
 python-dateutil
 matplotlib
+rapidfuzz
+apify-client==2.3.0

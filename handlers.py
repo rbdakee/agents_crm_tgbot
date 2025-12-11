@@ -1028,10 +1028,8 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
             keyboard.append([InlineKeyboardButton("Добавить ссылку", callback_data=f"add_link_{crm_id}")])
             keyboard.append([InlineKeyboardButton("Смена статуса объекта", callback_data=f"status_menu_{crm_id}")])
 
-    # Добавляем кнопку "Посмотреть Аналитику" если есть ЖК
-    complex_name = contract.get('ЖК') or contract.get('complex') or ''
-    if complex_name and complex_name.strip() and complex_name != 'N/A':
-        keyboard.append([InlineKeyboardButton("📊 Посмотреть Аналитику", callback_data=f"analytics_menu_{crm_id}")])
+    # Добавляем кнопку "Посмотреть Аналитику" (всегда доступна)
+    keyboard.append([InlineKeyboardButton("📊 Посмотреть Аналитику", callback_data=f"analytics_menu_{crm_id}")])
 
     keyboard.append([InlineKeyboardButton("🔙 Назад к списку", callback_data=back_to_list_callback)])
     keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
@@ -1056,52 +1054,17 @@ async def show_contract_detail_by_contract(update: Update, context: ContextTypes
 
 
 async def show_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
-    """Показывает меню аналитики для объекта"""
+    """Показывает меню аналитики для объекта (устаревшая функция, теперь сразу показываем график)"""
+    # Эта функция больше не используется, так как мы сразу показываем график
+    # Но оставляем для обратной совместимости
     query = update.callback_query
     try:
         await query.answer()
     except Exception as e:
         logger.warning(f"Failed to answer callback query: {e}")
-
-    agent_name = context.user_data.get('agent_name')
-    if not agent_name:
-        await query.edit_message_text("Ошибка: агент не найден")
-        return
-
-    db_manager = await get_db_manager()
-    role = get_user_role(context)
-    name_for_query = context.user_data.get('dd_query_name') if role == ROLE_DD else agent_name
-    contract = await db_manager.search_contract_by_crm_id(crm_id, name_for_query, role)
     
-    if not contract:
-        await query.edit_message_text("Контракт не найден среди ваших сделок")
-        return
-
-    # Получаем название ЖК
-    complex_name = contract.get('ЖК') or contract.get('complex') or ''
-    
-    if not complex_name or complex_name.strip() == '' or complex_name == 'N/A':
-        await query.edit_message_text(
-            "❌ Аналитика недоступна: не указан ЖК для данного объекта",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
-            ])
-        )
-        return
-
-    # Формируем сообщение с меню аналитики
-    message = f"📊 В данный момент существует аналитика по ЖК {complex_name}:\n\n"
-    message += "• График изменения цены"
-
-    keyboard = [
-        [InlineKeyboardButton("📈 График изменения цены", callback_data=f"price_chart_{crm_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
-    ]
-
-    await query.edit_message_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    # Сразу переходим к показу графика
+    await show_price_chart(update, context, crm_id)
 
 
 async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
@@ -1130,54 +1093,103 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
 
     # Получаем название ЖК
     complex_name = contract.get('ЖК') or contract.get('complex') or ''
-    
-    if not complex_name or complex_name.strip() == '' or complex_name == 'N/A':
-        await query.edit_message_text(
-            "❌ Аналитика недоступна: не указан ЖК для данного объекта",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Назад", callback_data=f"analytics_menu_{crm_id}")]
-            ])
-        )
-        return
+    has_complex = complex_name and complex_name.strip() and complex_name != 'N/A'
 
     loading_message_deleted = False
+    chart_bytes = None
+    chart_error_message = None
+    chart_complex_name = complex_name  # Инициализируем значением по умолчанию
+    
     try:
         # Импортируем сервис для работы с историей цен
         from services.price_history_service import get_price_history_for_complex, generate_price_chart
+        from services.parse_links_data import parse_all_links_analytics, format_analytics_text
 
-        # Получаем историю цен
-        price_data = await get_price_history_for_complex(complex_name)
-        
-        if not price_data.get('found'):
-            await query.edit_message_text(
-                f"❌ Данные по ЖК '{complex_name}' не найдены в таблице истории цен",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
-                ])
-            )
-            return
+        # Пытаемся получить график, если есть ЖК
+        if has_complex:
+            try:
+                price_data = await get_price_history_for_complex(complex_name)
+                
+                if price_data.get('found'):
+                    try:
+                        chart_bytes = generate_price_chart(price_data)
+                        chart_complex_name = price_data.get('complex_name', complex_name)
+                    except ValueError as e:
+                        chart_error_message = f"Наших данных недостаточно, чтобы построить график для ЖК {complex_name}"
+                else:
+                    chart_error_message = f"ЖК с именем {complex_name} нет в наших данных"
+            except Exception as e:
+                logger.error(f"Ошибка при получении данных графика: {e}", exc_info=True)
+                chart_error_message = f"Ошибка при получении данных для ЖК {complex_name}"
+        else:
+            chart_error_message = "Нет названия ЖК"
 
-        # Генерируем график
-        try:
-            chart_bytes = generate_price_chart(price_data)
-        except ValueError as e:
-            await query.edit_message_text(
-                f"❌ Недостаточно данных для построения графика: {str(e)}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
-                ])
-            )
-            return
+        # Собираем ссылки для парсинга (берем последние из каждого поля, разделенные по ';')
+        krisha_links = []
+        instagram_links = []
+        tiktok_links = []
+        
+        # Krisha ссылки
+        krisha_value = contract.get('krisha', '')
+        if krisha_value and isinstance(krisha_value, str):
+            krisha_links_list = [link.strip() for link in krisha_value.split(';') if link.strip()]
+            if krisha_links_list:
+                krisha_links.append(krisha_links_list[-1])
+        
+        # Instagram ссылки
+        instagram_value = contract.get('instagram', '')
+        if instagram_value and isinstance(instagram_value, str):
+            instagram_links_list = [link.strip() for link in instagram_value.split(';') if link.strip()]
+            if instagram_links_list:
+                instagram_links.append(instagram_links_list[-1])
+        
+        # TikTok ссылки
+        tiktok_value = contract.get('tiktok', '')
+        if tiktok_value and isinstance(tiktok_value, str):
+            tiktok_links_list = [link.strip() for link in tiktok_value.split(';') if link.strip()]
+            if tiktok_links_list:
+                tiktok_links.append(tiktok_links_list[-1])
+        
+        # Парсим аналитику по ссылкам (с обработкой ошибок)
+        analytics_data = None
+        analytics_error = False
+        has_any_links = bool(krisha_links or instagram_links or tiktok_links)
+        
+        if has_any_links:
+            try:
+                analytics_data = await parse_all_links_analytics(
+                    krisha_links=krisha_links,
+                    instagram_links=instagram_links,
+                    tiktok_links=tiktok_links
+                )
+                # Проверяем, есть ли хотя бы одна успешная ссылка
+                has_successful_analytics = (
+                    analytics_data.get("krisha", {}).get("urls_processed", 0) > 0 or
+                    analytics_data.get("instagram", {}).get("urls_processed", 0) > 0 or
+                    analytics_data.get("tiktok", {}).get("urls_processed", 0) > 0
+                )
+                if not has_successful_analytics:
+                    analytics_error = True
+            except Exception as e:
+                logger.error(f"Ошибка при парсинге ссылок: {e}", exc_info=True)
+                analytics_error = True
 
-        # Отправляем график с кнопкой "Назад"
-        from io import BytesIO
-        chart_file = BytesIO(chart_bytes)
-        chart_file.name = f"price_chart_{crm_id}.png"
+        # Формируем caption
+        # Заголовок графика
+        if chart_bytes:
+            if has_complex:
+                caption = f"📈 График изменения цены для ЖК: {chart_complex_name}\n\n"
+            else:
+                caption = f"📈 График изменения цены для ЖК: {complex_name}\n\n"
+        else:
+            if has_complex:
+                caption = f"📈 График изменения цены для ЖК: {complex_name} - Недоступен\n"
+                caption += f"({chart_error_message})\n\n"
+            else:
+                caption = "📈 График изменения цены недоступен\n"
+                caption += f"(причина: {chart_error_message})\n\n"
         
-        # Формируем caption с информацией об объекте
-        caption = f"📈 График изменения цены для ЖК: {price_data.get('complex_name', complex_name)}\n\n"
-        
-        # Цена из договора
+        # Данные из БД (всегда показываем)
         contract_price = contract.get('Цена указанная в договоре') or contract.get('contract_price') or 'N/A'
         caption += f"💰 Цена: {contract_price}\n"
         
@@ -1236,6 +1248,15 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         if available_links:
             caption += f"\n🔗 Ссылки: {', '.join(available_links)}"
         
+        # Добавляем аналитику по ссылкам
+        if has_any_links:
+            if analytics_error:
+                caption += f"\n\n❌ Ошибка при анализе ссылок"
+            elif analytics_data:
+                analytics_text = format_analytics_text(analytics_data)
+                if analytics_text and analytics_text != "❌ Нет данных для анализа":
+                    caption += f"\n\n{analytics_text}"
+        
         keyboard = [
             [InlineKeyboardButton("🔙 Назад", callback_data=f"back_from_chart_{crm_id}")]
         ]
@@ -1248,22 +1269,38 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
             # Если не удалось удалить, продолжаем
             pass
         
-        # Отправляем график с кнопкой "Назад"
-        await context.bot.send_photo(
-            chat_id=query.message.chat_id,
-            photo=chart_file,
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
-        )
+        # Отправляем результат
+        if chart_bytes:
+            # Отправляем график с кнопкой "Назад"
+            from io import BytesIO
+            chart_file = BytesIO(chart_bytes)
+            chart_file.name = f"price_chart_{crm_id}.png"
+            
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=chart_file,
+                caption=caption,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        else:
+            # Отправляем текстовое сообщение без графика
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=caption,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
         
     except Exception as e:
-        logger.error(f"Ошибка при генерации графика для ЖК '{complex_name}': {e}", exc_info=True)
+        logger.error(f"Ошибка при генерации аналитики: {e}", exc_info=True)
         # Проверяем, было ли удалено сообщение с загрузкой
         try:
             if not loading_message_deleted:
                 await query.edit_message_text(
-                    f"❌ Ошибка при загрузке данных или генерации графика: {str(e)}",
+                    f"❌ Ошибка при загрузке данных: {str(e)}",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
                     ])
@@ -1272,7 +1309,7 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
                 # Если сообщение удалено, отправляем новое
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text=f"❌ Ошибка при загрузке данных или генерации графика: {str(e)}",
+                    text=f"❌ Ошибка при загрузке данных: {str(e)}",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🔙 Назад", callback_data=f"contract_{crm_id}")]
                     ])

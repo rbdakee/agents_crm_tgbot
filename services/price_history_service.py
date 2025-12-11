@@ -11,6 +11,7 @@ from io import BytesIO
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
+from rapidfuzz import fuzz
 import matplotlib
 matplotlib.use('Agg')  # Используем backend без GUI
 import matplotlib.pyplot as plt
@@ -180,8 +181,8 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
             logger.error("Не удалось инициализировать лист истории цен")
             return {'found': False, 'complex_name': '', 'prices': {}}
         
-        # Приводим к нижнему регистру для поиска
-        search_lower = complex_name.lower().strip()
+        # Нормализуем название ЖК для поиска (убираем точки, слэши и т.д.)
+        search_normalized = _norm_complex(complex_name)
         
         # Проверяем кэш
         current_time = time.time()
@@ -209,7 +210,7 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
         found_row = None
         found_complex_name = None
         
-        # Сначала пытаемся найти точное совпадение
+        # Сначала пытаемся найти точное совпадение по нормализованным строкам
         for row_idx, row in enumerate(values):
             if len(row) <= 1:
                 continue
@@ -219,21 +220,21 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
             if not row_complex:
                 continue
             
-            # Приводим к нижнему регистру для сравнения
-            row_lower = row_complex.lower().strip()
+            # Нормализуем название из таблицы
+            row_normalized = _norm_complex(row_complex)
             
-            # Точное совпадение
-            if row_lower == search_lower:
+            # Точное совпадение по нормализованным строкам
+            if row_normalized == search_normalized:
                 found_row = row
                 found_complex_name = row_complex
                 break
         
-        # Если точное совпадение не найдено, ищем по подстроке
+        # Если точное совпадение не найдено, ищем по подстроке с использованием нормализованных строк
         if found_row is None:
             import re
             
-            # Разбиваем поисковую строку на слова
-            search_words = set(re.findall(r'\b\w+\b', search_lower))
+            # Разбиваем нормализованную поисковую строку на слова
+            search_words = set(search_normalized.split())
             
             best_match = None
             best_score = 0
@@ -248,12 +249,13 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
                 if not row_complex:
                     continue
                 
-                row_lower = row_complex.lower().strip()
+                # Нормализуем название из таблицы
+                row_normalized = _norm_complex(row_complex)
                 
-                # Проверяем, содержит ли строка из таблицы искомую строку или наоборот
-                if search_lower in row_lower or row_lower in search_lower:
+                # Проверяем, содержит ли нормализованная строка из таблицы искомую строку или наоборот
+                if search_normalized in row_normalized or row_normalized in search_normalized:
                     # Вычисляем "качество" совпадения
-                    row_words = set(re.findall(r'\b\w+\b', row_lower))
+                    row_words = set(row_normalized.split())
                     
                     # Количество совпадающих слов
                     matching_words = len(search_words & row_words)
@@ -263,7 +265,7 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
                     word_match_ratio = matching_words / total_search_words if total_search_words > 0 else 0
                     
                     # Бонус за близость длины (чем ближе длина, тем лучше)
-                    length_diff = abs(len(row_lower) - len(search_lower))
+                    length_diff = abs(len(row_normalized) - len(search_normalized))
                     length_bonus = 1.0 / (1.0 + length_diff / 10.0)  # Нормализуем разницу длины
                     
                     # Итоговый score: приоритет совпадению слов, затем близости длины
@@ -271,13 +273,37 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
                     
                     if score > best_score:
                         best_score = score
-                        best_match = row_lower
+                        best_match = row_normalized
                         best_row_idx = row_idx
                         best_original_name = row_complex
             
             if best_match:
                 found_row = values[best_row_idx]
                 found_complex_name = best_original_name
+        
+        # Если наш метод не нашел ничего — пробуем rapidfuzz как fallback
+        if found_row is None:
+            best_rf_score = 0
+            best_rf_idx = None
+            best_rf_name = None
+            for row_idx, row in enumerate(values):
+                if len(row) <= 1:
+                    continue
+                row_complex = (row[1] if len(row) > 1 else '').strip()
+                if not row_complex:
+                    continue
+                row_normalized = _norm_complex(row_complex)
+                # token_set_ratio устойчив к порядку и лишним словам
+                rf_score = fuzz.token_set_ratio(search_normalized, row_normalized)
+                if rf_score > best_rf_score:
+                    best_rf_score = rf_score
+                    best_rf_idx = row_idx
+                    best_rf_name = row_complex
+            # Порог подбираем консервативно, чтобы не ловить ложные совпадения
+            if best_rf_idx is not None and best_rf_score >= 75:
+                found_row = values[best_rf_idx]
+                found_complex_name = best_rf_name
+                logger.info(f"Найдена история цен (rapidfuzz) для ЖК '{found_complex_name}', score={best_rf_score}")
         
         if found_row is None:
             logger.warning(f"ЖК '{complex_name}' не найден в таблице истории цен")

@@ -1140,8 +1140,147 @@ async def _update_message_with_analytics(
         logger.error(f"Ошибка при обновлении сообщения с аналитикой: {e}", exc_info=True)
 
 
+async def _load_and_update_chart(
+    bot,
+    chat_id: int,
+    message_id: int,
+    crm_id: str,
+    complex_name: str,
+    has_complex: bool,
+    base_caption: str,
+    krisha_links: List[str],
+    instagram_links: List[str],
+    tiktok_links: List[str]
+):
+    """
+    Фоновая задача для загрузки графика и обновления сообщения
+    
+    Args:
+        bot: Экземпляр бота
+        chat_id: ID чата
+        message_id: ID сообщения для обновления
+        crm_id: ID контракта
+        complex_name: Название ЖК
+        has_complex: Есть ли название ЖК
+        base_caption: Базовый caption
+        krisha_links: Список ссылок Krisha
+        instagram_links: Список ссылок Instagram
+        tiktok_links: Список ссылок TikTok
+    """
+    try:
+        from services.price_history_service import get_price_history_for_complex, generate_price_chart
+        
+        chart_bytes = None
+        chart_error_message = None
+        chart_complex_name = complex_name
+        
+        # Пытаемся получить график, если есть ЖК
+        if has_complex:
+            try:
+                price_data = await get_price_history_for_complex(complex_name)
+                
+                if price_data.get('found'):
+                    try:
+                        # Генерируем график в отдельном потоке, чтобы не блокировать event loop
+                        chart_bytes = await asyncio.to_thread(generate_price_chart, price_data)
+                        chart_complex_name = price_data.get('complex_name', complex_name)
+                    except ValueError as e:
+                        chart_error_message = f"Наших данных недостаточно, чтобы построить график для ЖК {complex_name}"
+                else:
+                    chart_error_message = f"ЖК с именем {complex_name} нет в наших данных"
+            except Exception as e:
+                logger.error(f"Ошибка при получении данных графика: {e}", exc_info=True)
+                chart_error_message = f"Ошибка при получении данных для ЖК {complex_name}"
+        else:
+            chart_error_message = "Нет названия ЖК"
+        
+        # Формируем обновленный caption
+        if chart_bytes:
+            if has_complex:
+                caption = f"📈 График изменения цены для ЖК: {chart_complex_name}\n\n"
+            else:
+                caption = f"📈 График изменения цены для ЖК: {complex_name}\n\n"
+        else:
+            if has_complex:
+                caption = f"📈 График изменения цены для ЖК: {complex_name} - Недоступен\n"
+                caption += f"({chart_error_message})\n\n"
+            else:
+                caption = "📈 График изменения цены недоступен\n"
+                caption += f"(причина: {chart_error_message})\n\n"
+        
+        # Добавляем базовую информацию из контракта
+        caption += base_caption
+        
+        # Удаляем индикатор загрузки графика, если он был
+        caption = caption.replace("⏳ Загрузка графика...", "")
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"back_from_chart_{crm_id}")]
+        ]
+        
+        # Обновляем сообщение с графиком
+        final_message_id = message_id
+        if chart_bytes:
+            from io import BytesIO
+            chart_file = BytesIO(chart_bytes)
+            chart_file.name = f"price_chart_{crm_id}.png"
+            
+            # Пытаемся обновить caption, если это фото
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=caption,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                # Если не получилось обновить (например, это текстовое сообщение), отправляем новое
+                sent_photo = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=chart_file,
+                    caption=caption,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode=ParseMode.HTML
+                )
+                final_message_id = sent_photo.message_id
+                # Удаляем старое сообщение
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                except Exception:
+                    pass
+        else:
+            # Обновляем текстовое сообщение
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=caption,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        
+        # Запускаем фоновую задачу для парсинга аналитики (если есть ссылки)
+        has_any_links = bool(krisha_links or instagram_links or tiktok_links)
+        if has_any_links:
+            asyncio.create_task(_parse_and_update_analytics(
+                bot,
+                chat_id,
+                final_message_id,  # Используем актуальный ID сообщения
+                crm_id,
+                chart_bytes,
+                caption,
+                krisha_links,
+                instagram_links,
+                tiktok_links
+            ))
+            
+    except Exception as e:
+        logger.error(f"Ошибка в фоновой задаче загрузки графика: {e}", exc_info=True)
+
+
 async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
-    """Показывает график изменения цены для объекта (асинхронно загружает аналитику в фоне)"""
+    """Показывает график изменения цены для объекта (асинхронно загружает график и аналитику в фоне)"""
     query = update.callback_query
     try:
         await query.answer()
@@ -1169,34 +1308,8 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     has_complex = complex_name and complex_name.strip() and complex_name != 'N/A'
 
     loading_message_deleted = False
-    chart_bytes = None
-    chart_error_message = None
-    chart_complex_name = complex_name  # Инициализируем значением по умолчанию
     
     try:
-        # Импортируем сервис для работы с историей цен
-        from services.price_history_service import get_price_history_for_complex, generate_price_chart
-        from services.parse_links_data import parse_all_links_analytics
-
-        # Пытаемся получить график, если есть ЖК
-        if has_complex:
-            try:
-                price_data = await get_price_history_for_complex(complex_name)
-                
-                if price_data.get('found'):
-                    try:
-                        chart_bytes = generate_price_chart(price_data)
-                        chart_complex_name = price_data.get('complex_name', complex_name)
-                    except ValueError as e:
-                        chart_error_message = f"Наших данных недостаточно, чтобы построить график для ЖК {complex_name}"
-                else:
-                    chart_error_message = f"ЖК с именем {complex_name} нет в наших данных"
-            except Exception as e:
-                logger.error(f"Ошибка при получении данных графика: {e}", exc_info=True)
-                chart_error_message = f"Ошибка при получении данных для ЖК {complex_name}"
-        else:
-            chart_error_message = "Нет названия ЖК"
-
         # Собираем ссылки для парсинга (берем последние из каждого поля, разделенные по ';')
         krisha_links = []
         instagram_links = []
@@ -1225,20 +1338,12 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         
         has_any_links = bool(krisha_links or instagram_links or tiktok_links)
 
-        # Формируем базовый caption (без аналитики)
-        # Заголовок графика
-        if chart_bytes:
-            if has_complex:
-                caption = f"📈 График изменения цены для ЖК: {chart_complex_name}\n\n"
-            else:
-                caption = f"📈 График изменения цены для ЖК: {complex_name}\n\n"
+        # Формируем базовый caption (без графика и аналитики)
+        caption = "📈 График изменения цены\n\n"
+        if has_complex:
+            caption += f"⏳ Загрузка графика для ЖК: {complex_name}...\n\n"
         else:
-            if has_complex:
-                caption = f"📈 График изменения цены для ЖК: {complex_name} - Недоступен\n"
-                caption += f"({chart_error_message})\n\n"
-            else:
-                caption = "📈 График изменения цены недоступен\n"
-                caption += f"(причина: {chart_error_message})\n\n"
+            caption += "⏳ Загрузка данных...\n\n"
         
         # Данные из БД (всегда показываем)
         contract_price = contract.get('Цена указанная в договоре') or contract.get('contract_price') or 'N/A'
@@ -1315,44 +1420,35 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
             # Если не удалось удалить, продолжаем
             pass
         
-        # Отправляем результат (без аналитики, она загрузится в фоне)
-        sent_message = None
-        if chart_bytes:
-            # Отправляем график с кнопкой "Назад"
-            from io import BytesIO
-            chart_file = BytesIO(chart_bytes)
-            chart_file.name = f"price_chart_{crm_id}.png"
-            
-            sent_message = await context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=chart_file,
-                caption=caption,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            # Отправляем текстовое сообщение без графика
-            sent_message = await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=caption,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
+        # Отправляем базовое сообщение сразу (без графика)
+        sent_message = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=caption,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
         
-        # Запускаем фоновую задачу для парсинга аналитики (если есть ссылки)
-        if has_any_links and sent_message:
-            asyncio.create_task(_parse_and_update_analytics(
-                context.bot,
-                query.message.chat_id,
-                sent_message.message_id,
-                crm_id,
-                chart_bytes,
-                caption,
-                krisha_links,
-                instagram_links,
-                tiktok_links
-            ))
+        # Извлекаем базовую информацию (без заголовка и индикаторов загрузки)
+        base_info_lines = []
+        for line in caption.split("\n"):
+            if line and not line.startswith("📈") and "⏳" not in line:
+                base_info_lines.append(line)
+        base_info = "\n".join(base_info_lines).strip()
+        
+        # Запускаем фоновую задачу для загрузки графика
+        asyncio.create_task(_load_and_update_chart(
+            context.bot,
+            query.message.chat_id,
+            sent_message.message_id,
+            crm_id,
+            complex_name,
+            has_complex,
+            base_info,
+            krisha_links,
+            instagram_links,
+            tiktok_links
+        ))
         
     except Exception as e:
         logger.error(f"Ошибка при генерации аналитики: {e}", exc_info=True)

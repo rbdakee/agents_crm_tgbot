@@ -1,5 +1,5 @@
 import logging, asyncio, os, re, html
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from database_postgres import get_db_manager
@@ -1067,8 +1067,81 @@ async def show_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     await show_price_chart(update, context, crm_id)
 
 
+async def _update_message_with_analytics(
+    bot,
+    chat_id: int,
+    message_id: int,
+    crm_id: str,
+    chart_bytes: Optional[bytes],
+    base_caption: str,
+    analytics_data: Optional[Dict[str, Any]],
+    analytics_error: bool,
+    has_any_links: bool
+):
+    """
+    Фоновая задача для обновления сообщения с аналитикой после парсинга ссылок
+    
+    Args:
+        bot: Экземпляр бота
+        chat_id: ID чата
+        message_id: ID сообщения для обновления
+        crm_id: ID контракта
+        chart_bytes: Байты графика (если есть)
+        base_caption: Базовый caption без аналитики
+        analytics_data: Данные аналитики
+        analytics_error: Флаг ошибки аналитики
+        has_any_links: Есть ли ссылки для парсинга
+    """
+    try:
+        from services.parse_links_data import format_analytics_text
+        
+        # Формируем финальный caption с аналитикой
+        # Удаляем индикатор загрузки, если он есть
+        caption = base_caption.replace("\n\n⏳ Загрузка аналитики по ссылкам...", "")
+        
+        # Добавляем аналитику по ссылкам
+        if has_any_links:
+            if analytics_error:
+                caption += f"\n\n❌ Ошибка при анализе ссылок"
+            elif analytics_data:
+                analytics_text = format_analytics_text(analytics_data)
+                if analytics_text and analytics_text != "❌ Нет данных для анализа":
+                    caption += f"\n\n{analytics_text}"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"back_from_chart_{crm_id}")]
+        ]
+        
+        # Обновляем сообщение
+        if chart_bytes:
+            # Обновляем фото с новым caption
+            from io import BytesIO
+            chart_file = BytesIO(chart_bytes)
+            chart_file.name = f"price_chart_{crm_id}.png"
+            
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=caption,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            # Обновляем текстовое сообщение
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=caption,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении сообщения с аналитикой: {e}", exc_info=True)
+
+
 async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, crm_id: str):
-    """Показывает график изменения цены для объекта"""
+    """Показывает график изменения цены для объекта (асинхронно загружает аналитику в фоне)"""
     query = update.callback_query
     try:
         await query.answer()
@@ -1103,7 +1176,7 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     try:
         # Импортируем сервис для работы с историей цен
         from services.price_history_service import get_price_history_for_complex, generate_price_chart
-        from services.parse_links_data import parse_all_links_analytics, format_analytics_text
+        from services.parse_links_data import parse_all_links_analytics
 
         # Пытаемся получить график, если есть ЖК
         if has_complex:
@@ -1150,31 +1223,9 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
             if tiktok_links_list:
                 tiktok_links.append(tiktok_links_list[-1])
         
-        # Парсим аналитику по ссылкам (с обработкой ошибок)
-        analytics_data = None
-        analytics_error = False
         has_any_links = bool(krisha_links or instagram_links or tiktok_links)
-        
-        if has_any_links:
-            try:
-                analytics_data = await parse_all_links_analytics(
-                    krisha_links=krisha_links,
-                    instagram_links=instagram_links,
-                    tiktok_links=tiktok_links
-                )
-                # Проверяем, есть ли хотя бы одна успешная ссылка
-                has_successful_analytics = (
-                    analytics_data.get("krisha", {}).get("urls_processed", 0) > 0 or
-                    analytics_data.get("instagram", {}).get("urls_processed", 0) > 0 or
-                    analytics_data.get("tiktok", {}).get("urls_processed", 0) > 0
-                )
-                if not has_successful_analytics:
-                    analytics_error = True
-            except Exception as e:
-                logger.error(f"Ошибка при парсинге ссылок: {e}", exc_info=True)
-                analytics_error = True
 
-        # Формируем caption
+        # Формируем базовый caption (без аналитики)
         # Заголовок графика
         if chart_bytes:
             if has_complex:
@@ -1248,14 +1299,9 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         if available_links:
             caption += f"\n🔗 Ссылки: {', '.join(available_links)}"
         
-        # Добавляем аналитику по ссылкам
+        # Если есть ссылки, добавляем индикатор загрузки аналитики
         if has_any_links:
-            if analytics_error:
-                caption += f"\n\n❌ Ошибка при анализе ссылок"
-            elif analytics_data:
-                analytics_text = format_analytics_text(analytics_data)
-                if analytics_text and analytics_text != "❌ Нет данных для анализа":
-                    caption += f"\n\n{analytics_text}"
+            caption += f"\n\n⏳ Загрузка аналитики по ссылкам..."
         
         keyboard = [
             [InlineKeyboardButton("🔙 Назад", callback_data=f"back_from_chart_{crm_id}")]
@@ -1269,30 +1315,44 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
             # Если не удалось удалить, продолжаем
             pass
         
-        # Отправляем результат
+        # Отправляем результат (без аналитики, она загрузится в фоне)
+        sent_message = None
         if chart_bytes:
             # Отправляем график с кнопкой "Назад"
             from io import BytesIO
             chart_file = BytesIO(chart_bytes)
             chart_file.name = f"price_chart_{crm_id}.png"
             
-            await context.bot.send_photo(
+            sent_message = await context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=chart_file,
                 caption=caption,
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
+                parse_mode=ParseMode.HTML
             )
         else:
             # Отправляем текстовое сообщение без графика
-            await context.bot.send_message(
+            sent_message = await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=caption,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True
             )
+        
+        # Запускаем фоновую задачу для парсинга аналитики (если есть ссылки)
+        if has_any_links and sent_message:
+            asyncio.create_task(_parse_and_update_analytics(
+                context.bot,
+                query.message.chat_id,
+                sent_message.message_id,
+                crm_id,
+                chart_bytes,
+                caption,
+                krisha_links,
+                instagram_links,
+                tiktok_links
+            ))
         
     except Exception as e:
         logger.error(f"Ошибка при генерации аналитики: {e}", exc_info=True)
@@ -1316,6 +1376,74 @@ async def show_price_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, c
                 )
         except Exception as edit_error:
             logger.error(f"Ошибка при обработке ошибки: {edit_error}", exc_info=True)
+
+
+async def _parse_and_update_analytics(
+    bot,
+    chat_id: int,
+    message_id: int,
+    crm_id: str,
+    chart_bytes: Optional[bytes],
+    base_caption: str,
+    krisha_links: List[str],
+    instagram_links: List[str],
+    tiktok_links: List[str]
+):
+    """
+    Фоновая задача для парсинга аналитики и обновления сообщения
+    
+    Args:
+        bot: Экземпляр бота
+        chat_id: ID чата
+        message_id: ID сообщения для обновления
+        crm_id: ID контракта
+        chart_bytes: Байты графика (если есть)
+        base_caption: Базовый caption без аналитики
+        krisha_links: Список ссылок Krisha
+        instagram_links: Список ссылок Instagram
+        tiktok_links: Список ссылок TikTok
+    """
+    try:
+        from services.parse_links_data import parse_all_links_analytics
+        
+        # Парсим аналитику по ссылкам (с обработкой ошибок)
+        analytics_data = None
+        analytics_error = False
+        has_any_links = bool(krisha_links or instagram_links or tiktok_links)
+        
+        if has_any_links:
+            try:
+                analytics_data = await parse_all_links_analytics(
+                    krisha_links=krisha_links,
+                    instagram_links=instagram_links,
+                    tiktok_links=tiktok_links
+                )
+                # Проверяем, есть ли хотя бы одна успешная ссылка
+                has_successful_analytics = (
+                    analytics_data.get("krisha", {}).get("urls_processed", 0) > 0 or
+                    analytics_data.get("instagram", {}).get("urls_processed", 0) > 0 or
+                    analytics_data.get("tiktok", {}).get("urls_processed", 0) > 0
+                )
+                if not has_successful_analytics:
+                    analytics_error = True
+            except Exception as e:
+                logger.error(f"Ошибка при парсинге ссылок: {e}", exc_info=True)
+                analytics_error = True
+        
+        # Обновляем сообщение с аналитикой
+        await _update_message_with_analytics(
+            bot=bot,
+            chat_id=chat_id,
+            message_id=message_id,
+            crm_id=crm_id,
+            chart_bytes=chart_bytes,
+            base_caption=base_caption,
+            analytics_data=analytics_data,
+            analytics_error=analytics_error,
+            has_any_links=has_any_links
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в фоновой задаче парсинга аналитики: {e}", exc_info=True)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

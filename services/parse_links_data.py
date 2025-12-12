@@ -13,6 +13,7 @@ from contextlib import contextmanager
 
 import httpx
 from apify_client import ApifyClient
+from apify_client.errors import ApifyApiError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -200,6 +201,25 @@ async def parse_tiktok_stats(tiktok_url: str) -> Optional[Dict[str, int]]:
         return None
 
 
+def _validate_instagram_url(url: str) -> bool:
+    """
+    Валидирует URL Instagram перед отправкой в Apify
+    
+    Args:
+        url: URL для проверки
+        
+    Returns:
+        True если URL валиден, False иначе
+    """
+    if not url or not isinstance(url, str):
+        return False
+    
+    # Apify требует формат: https://(www.)?instagram.com/.+
+    # То есть после домена должен быть хотя бы один символ
+    pattern = r'^https://(www\.)?instagram\.com/.+'
+    return bool(re.match(pattern, url.strip()))
+
+
 async def parse_instagram_stats(instagram_url: str) -> Optional[Dict[str, int]]:
     """
     Парсит статистику Instagram поста через Apify
@@ -212,6 +232,11 @@ async def parse_instagram_stats(instagram_url: str) -> Optional[Dict[str, int]]:
         или None в случае ошибки
     """
     try:
+        # Валидация URL перед отправкой в Apify
+        if not _validate_instagram_url(instagram_url):
+            logger.warning(f"Неверный формат Instagram URL: {instagram_url}. URL должен быть в формате https://instagram.com/username или https://instagram.com/p/post_id")
+            return None
+        
         token = os.getenv("APIFY_API_TOKEN")
         if not token:
             logger.error("Переменная окружения APIFY_API_TOKEN не задана")
@@ -247,8 +272,16 @@ async def parse_instagram_stats(instagram_url: str) -> Optional[Dict[str, int]]:
         
         return stats
         
+    except ApifyApiError as e:
+        # Обрабатываем ошибки Apify API отдельно для более понятных сообщений
+        error_message = str(e)
+        if "Input is not valid" in error_message or "must match regular expression" in error_message:
+            logger.warning(f"Неверный формат Instagram URL для Apify: {instagram_url}. URL должен содержать путь после домена (например: https://instagram.com/username или https://instagram.com/p/post_id)")
+        else:
+            logger.warning(f"Ошибка Apify API при парсинге Instagram {instagram_url}: {error_message}")
+        return None
     except Exception as e:
-        logger.error(f"Ошибка при парсинге Instagram {instagram_url}: {e}", exc_info=True)
+        logger.error(f"Неожиданная ошибка при парсинге Instagram {instagram_url}: {e}", exc_info=True)
         return None
 
 

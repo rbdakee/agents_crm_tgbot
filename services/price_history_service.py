@@ -98,7 +98,19 @@ async def _get_all_values_with_retry(max_attempts: int = 3, base_delay: float = 
             
         except APIError as e:
             last_error = e
-            error_code = getattr(e, 'response', {}).get('status', 0) if hasattr(e, 'response') else 0
+            # Правильное извлечение кода статуса из APIError
+            error_code = 0
+            if hasattr(e, 'response') and e.response is not None:
+                # response - это объект Response, используем status_code
+                error_code = getattr(e.response, 'status_code', 0)
+            else:
+                # Если response нет, пытаемся извлечь из строки ошибки
+                # Формат: "APIError: [503]: The service is currently unavailable."
+                import re
+                error_str = str(e)
+                match = re.search(r'\[(\d+)\]', error_str)
+                if match:
+                    error_code = int(match.group(1))
             
             # Обрабатываем только временные ошибки (503, 500, 429)
             if error_code in [503, 500, 429]:
@@ -339,7 +351,19 @@ async def get_price_history_for_complex(complex_name: str) -> Dict[str, Any]:
         }
         
     except APIError as e:
-        error_code = getattr(e, 'response', {}).get('status', 0) if hasattr(e, 'response') else 0
+        # Правильное извлечение кода статуса из APIError
+        error_code = 0
+        if hasattr(e, 'response') and e.response is not None:
+            # response - это объект Response, используем status_code
+            error_code = getattr(e.response, 'status_code', 0)
+        else:
+            # Если response нет, пытаемся извлечь из строки ошибки
+            # Формат: "APIError: [503]: The service is currently unavailable."
+            import re
+            error_str = str(e)
+            match = re.search(r'\[(\d+)\]', error_str)
+            if match:
+                error_code = int(match.group(1))
         logger.error(
             f"Ошибка API {error_code} при получении истории цен для ЖК '{complex_name}': {e}",
             exc_info=True
